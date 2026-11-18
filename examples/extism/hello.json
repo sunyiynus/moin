@@ -1,0 +1,10 @@
+{
+  "command": "hello",
+  "description": "Extism 问候示例 · hello 世界",
+  "runtime": "extism",
+  "wasm": "moin_extism_hello.wasm",
+  "function": "run",
+  "config": {
+    "greeting": "你好"
+  }
+}

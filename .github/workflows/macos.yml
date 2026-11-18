@@ -1,0 +1,51 @@
+name: macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install native build tools
+        run: |
+          brew install protobuf cmake
+          echo "PROTOC=$(brew --prefix protobuf)/bin/protoc" >> "$GITHUB_ENV"
+          echo "PROTOC_INCLUDE=$(brew --prefix protobuf)/include" >> "$GITHUB_ENV"
+          xcrun --find metal
+      - run: cargo fmt --all -- --check
+      - name: Build the Extism SDK example
+        run: cargo build --manifest-path examples/extism/Cargo.toml --target wasm32-unknown-unknown --release --locked
+      - run: cargo test --locked --all-targets
+      - name: Build and package native app
+        run: python3 scripts/package_macos.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moin-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/moin-*.tar.gz
+          if-no-files-found: error

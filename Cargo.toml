@@ -1,0 +1,73 @@
+[package]
+name = "moin"
+version = "0.2.0"
+edition = "2024"
+default-run = "moin"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+arrow-array = "56.2"
+arrow-schema = "56.2"
+async-channel = "2"
+# GPUI and DataFusion must share the xz2 native compression provider.
+async-compression = { version = "=0.4.19", default-features = false }
+directories = "6"
+extism = { version = "=1.41.0", default-features = false }
+futures = "0.3"
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+lancedb = { version = "=0.23.1", default-features = false }
+meval = "0.2"
+plist = "1"
+pulldown-cmark = { version = "0.13.6", default-features = false }
+rig = { package = "rig-core", version = "=0.46.0", default-features = false, features = ["reqwest", "rustls"] }
+rig-agent = { version = "=0.46.0", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
+unicode-segmentation = "1.12"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+url = "2"
+walkdir = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.0"
+fs2 = "0.4"
+global-hotkey = "0.8"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+objc = "0.2"
+raw-window-handle = "0.6"
+tray-icon = { version = "=0.26.1", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+image = { version = "0.25", default-features = false }
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[dev-dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["test-support"] }
+tempfile = "3"
+wat = "1"
