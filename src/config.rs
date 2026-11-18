@@ -6,10 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const CONFIG_FILE: &str = "config.toml";
-const LEGACY_CONFIG_FILE: &str = "config.json";
-const LEGACY_AI_FILE: &str = "ai.json";
-const LEGACY_EMBEDDING_FILE: &str = "embeddings.json";
+const CONFIG_FILE: &str = "settings.json";
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -146,12 +143,17 @@ impl Config {
         match fs::read_to_string(&path) {
             Ok(text) => {
                 let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-                let mut config: Self =
-                    toml::from_str(text).with_context(|| format!("无法读取 {}", path.display()))?;
+                let mut config: Self = serde_json::from_str(text)
+                    .with_context(|| format!("无法读取 {}", path.display()))?;
                 config.appearance = config.appearance.normalized();
                 Ok(config)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::migrate(home),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let config = Self::default();
+                // Best effort: create the file so the user has a concrete config to edit.
+                let _ = config.save(home);
+                Ok(config)
+            }
             Err(error) => Err(error).with_context(|| format!("无法读取 {}", path.display())),
         }
     }
@@ -159,44 +161,10 @@ impl Config {
     pub fn save(&self, home: &Path) -> Result<()> {
         fs::create_dir_all(home).context("无法创建 Moin 数据目录")?;
         let path = home.join(CONFIG_FILE);
-        let temporary = home.join("config.toml.tmp");
-        let text = toml::to_string_pretty(self).context("无法序列化 Moin 设置")?;
+        let temporary = home.join("settings.json.tmp");
+        let text = serde_json::to_string_pretty(self).context("无法序列化 Moin 设置")?;
         fs::write(&temporary, text).context("无法写入 Moin 设置")?;
         fs::rename(temporary, path).context("无法保存 Moin 设置")
-    }
-
-    /// Read the old split config files once and convert them to config.toml.
-    fn migrate(home: &Path) -> Result<Self> {
-        let mut config = Self::default();
-        match fs::read(home.join(LEGACY_CONFIG_FILE)) {
-            Ok(bytes) => {
-                config = serde_json::from_slice(&bytes).context("无法读取旧版 config.json 设置")?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("无法读取旧版 config.json 设置"),
-        }
-        match fs::read(home.join(LEGACY_AI_FILE)) {
-            Ok(bytes) => {
-                if let Ok(ai) = serde_json::from_slice::<AiConfig>(&bytes) {
-                    config.ai = ai;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("无法读取旧版 ai.json 设置"),
-        }
-        match fs::read(home.join(LEGACY_EMBEDDING_FILE)) {
-            Ok(bytes) => {
-                if let Ok(embedding) = serde_json::from_slice::<EmbeddingConfig>(&bytes) {
-                    config.embedding = Some(embedding);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("无法读取旧版 embeddings.json 设置"),
-        }
-        config.appearance = config.appearance.normalized();
-        // Best effort: the app can still run while the directory is read-only.
-        let _ = config.save(home);
-        Ok(config)
     }
 }
 
@@ -205,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_settings_through_toml() -> Result<()> {
+    fn round_trips_settings_through_json() -> Result<()> {
         let folder = tempfile::tempdir()?;
         let mut config = Config::load(folder.path())?;
         assert_eq!(config.activation_hotkey, "Alt+Space");
@@ -241,54 +209,6 @@ mod tests {
         assert!(restored.everything.enabled);
         assert_eq!(restored.recent_apps.len(), 1);
         assert_eq!(restored.recent_apps[0].title, "Moin");
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_legacy_json_settings() -> Result<()> {
-        let folder = tempfile::tempdir()?;
-        fs::write(
-            folder.path().join("config.json"),
-            r#"{"roots":["C:\\Docs"],"activation_hotkey":"Ctrl+Alt+M"}"#,
-        )?;
-        fs::write(
-            folder.path().join("ai.json"),
-            r#"{
-                "provider": "ollama",
-                "base_url": "http://127.0.0.1:11434",
-                "model": "qwen2.5:3b",
-                "api_key_env": "OPENAI_API_KEY",
-                "system_prompt": "自定义角色",
-                "use_local_documents": true,
-                "allow_commands": false,
-                "command_working_directory": ""
-            }"#,
-        )?;
-        fs::write(
-            folder.path().join("embeddings.json"),
-            r#"{"model":"bge-m3","endpoint":"http://127.0.0.1:11434/api/embed","dimensions":1024}"#,
-        )?;
-        let config = Config::load(folder.path())?;
-        assert_eq!(config.activation_hotkey, "Ctrl+Alt+M");
-        assert_eq!(config.ai.model, "qwen2.5:3b");
-        assert_eq!(config.ai.system_prompt, "自定义角色");
-        assert!(config.ai.use_local_documents);
-        assert_eq!(
-            config.embedding.as_ref().map(|value| value.model.as_str()),
-            Some("bge-m3")
-        );
-        assert!(folder.path().join("config.toml").is_file());
-
-        let reloaded = Config::load(folder.path())?;
-        assert_eq!(reloaded.ai.model, "qwen2.5:3b");
-        assert_eq!(reloaded.activation_hotkey, "Ctrl+Alt+M");
-        assert_eq!(
-            reloaded
-                .embedding
-                .as_ref()
-                .map(|value| value.model.as_str()),
-            Some("bge-m3")
-        );
         Ok(())
     }
 

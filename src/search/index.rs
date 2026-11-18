@@ -1280,7 +1280,7 @@ mod tests {
             )?,
             version
         );
-        fs::write(temp.path().join("embeddings.json"), "{")?;
+        fs::write(temp.path().join("settings.json"), "{\"embedding\":")?;
         assert!(rebuild(&database, &[docs]).is_err());
         assert_eq!(summary(&database)?, result);
         assert!(!retrieve(&database, "资料", 5)?.is_empty());
@@ -1300,10 +1300,12 @@ mod tests {
         listener.set_nonblocking(true)?;
         let endpoint = format!("http://{}/api/embed", listener.local_addr()?);
         fs::write(
-            temp.path().join("embeddings.json"),
+            temp.path().join("settings.json"),
             serde_json::to_vec(&serde_json::json!({
-                "model": "test-semantic",
-                "endpoint": endpoint,
+                "embedding": {
+                    "model": "test-semantic",
+                    "endpoint": endpoint,
+                }
             }))?,
         )?;
         let running = Arc::new(AtomicBool::new(true));

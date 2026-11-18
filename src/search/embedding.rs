@@ -1,14 +1,8 @@
 use crate::config::EmbeddingConfig;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{self, File},
-    io::{self, Read},
-    path::Path,
-    time::Duration,
-};
+use std::{fs, io::Read, path::Path, time::Duration};
 
-const LEGACY_CONFIG: &str = "embeddings.json";
 const LOCAL_DIMENSIONS: usize = 384;
 const MAX_DIMENSIONS: usize = 8192;
 const MAX_INPUT_BYTES: usize = 16 * 1024;
@@ -53,45 +47,24 @@ pub struct Embeddings {
 
 impl Embeddings {
     pub fn load(home: &Path) -> Result<Self> {
-        let config_path = home.join("config.toml");
-        if config_path.is_file() {
-            let text = fs::read_to_string(&config_path)
-                .with_context(|| format!("无法读取 {}", config_path.display()))?;
-            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-            let document: ConfigDocument = toml::from_str(text)
-                .with_context(|| format!("无法读取 {}", config_path.display()))?;
-            if let Some(config) = document.embedding {
-                return Self::from_profile(EmbeddingProfile::OllamaV1 {
-                    model: config.model,
-                    endpoint: config.endpoint,
-                    dimensions: config.dimensions,
-                })
-                .with_context(|| format!("{} 的 [embedding] 配置有误", config_path.display()));
-            }
+        let config_path = home.join("settings.json");
+        if !config_path.is_file() {
+            return Self::from_profile(EmbeddingProfile::LocalLexicalV1);
         }
-
-        let path = home.join(LEGACY_CONFIG);
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Self::from_profile(EmbeddingProfile::LocalLexicalV1);
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("无法读取 {}", path.display()));
-            }
-        };
-        let config: EmbeddingConfig = (|| {
-            let bytes = read_limited(file, 4096)?;
-            let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-            serde_json::from_slice(bytes).context("JSON 格式有误")
-        })()
-        .with_context(|| format!("无法读取 {}", path.display()))?;
-        Self::from_profile(EmbeddingProfile::OllamaV1 {
-            model: config.model,
-            endpoint: config.endpoint,
-            dimensions: config.dimensions,
-        })
-        .with_context(|| format!("{} 配置有误", path.display()))
+        let text = fs::read_to_string(&config_path)
+            .with_context(|| format!("无法读取 {}", config_path.display()))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let document: ConfigDocument = serde_json::from_str(text)
+            .with_context(|| format!("无法读取 {}", config_path.display()))?;
+        match document.embedding {
+            Some(config) => Self::from_profile(EmbeddingProfile::OllamaV1 {
+                model: config.model,
+                endpoint: config.endpoint,
+                dimensions: config.dimensions,
+            })
+            .with_context(|| format!("{} 的 embedding 配置有误", config_path.display())),
+            None => Self::from_profile(EmbeddingProfile::LocalLexicalV1),
+        }
     }
 
     pub fn from_profile(mut profile: EmbeddingProfile) -> Result<Self> {
@@ -350,11 +323,11 @@ mod tests {
     };
 
     #[test]
-    fn loads_embedding_profile_from_config_toml() -> Result<()> {
+    fn loads_embedding_profile_from_settings_json() -> Result<()> {
         let folder = tempfile::tempdir()?;
         fs::write(
-            folder.path().join("config.toml"),
-            "[embedding]\nmodel = \"bge-m3\"\nendpoint = \"http://127.0.0.1:11434/api/embed\"\ndimensions = 1024\n",
+            folder.path().join("settings.json"),
+            r#"{"embedding":{"model":"bge-m3","endpoint":"http://127.0.0.1:11434/api/embed","dimensions":1024}}"#,
         )?;
         let provider = Embeddings::load(folder.path())?;
         assert_eq!(

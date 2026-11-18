@@ -25,7 +25,6 @@ rig-agent = { version = "=0.46.0", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
 unicode-segmentation = "1.12"
 ureq = { version = "2.12", default-features = false, features = ["json"] }

@@ -1282,7 +1282,7 @@ impl Settings {
                         ),
                     )
                     .child(description(
-                        "所有界面设置统一保存在数据目录的 config.toml。",
+                        "所有界面设置统一保存在数据目录的 settings.json。",
                     ))
                     .child(
                         setting_row(

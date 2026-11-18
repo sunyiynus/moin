@@ -20,7 +20,7 @@ Moin 使用 [Rig](https://github.com/0xPlaygrounds/rig) 构建内置 Agent。对
 
 左侧会话列表支持新建、切换和删除，标题取自首次提问。各会话的历史、草稿、运行任务彼此独立；切换或新建不会取消原会话正在执行的任务，运行中的会话带状态标记。停止按钮只结束当前会话任务；删除会话会同时结束该会话任务。
 
-聊天记录保存在当前进程内存中，退出 Moin 后不会保留。停止生成的片段仍可查看，但不加入后续对话上下文。每次请求最多携带最近 24 条消息、48,000 字符的历史，单条问题最多 16,000 字符。AI 设置保存在应用数据目录 `config.toml` 的 `[ai]` 表中；保存新设置会结束所有会话的生成并清空上下文，已有显示记录保留，后续请求使用新配置。两个对话窗口均沿用主浮窗的透明亚克力背景。
+聊天记录保存在当前进程内存中，退出 Moin 后不会保留。停止生成的片段仍可查看，但不加入后续对话上下文。每次请求最多携带最近 24 条消息、48,000 字符的历史，单条问题最多 16,000 字符。AI 设置保存在应用数据目录 `settings.json` 的 `ai` 对象中；保存新设置会结束所有会话的生成并清空上下文，已有显示记录保留，后续请求使用新配置。两个对话窗口均沿用主浮窗的透明亚克力背景。
 
 ## 显示设置
 
@@ -29,7 +29,7 @@ Moin 使用 [Rig](https://github.com/0xPlaygrounds/rig) 构建内置 Agent。对
 - **AI 对话字体**只影响对话中的提问、回答、Markdown 内容和输入框。
 - **界面字体**影响搜索框、结果列表、设置窗口等其余文字。
 
-每组都可以填写字体名称并调整字号。字体名称留空时使用系统字体；AI 对话字体留空时跟随界面字体。下方提供预览，保存后两个窗口会立即使用新设置。外观设置保存在 `config.toml` 的 `[appearance]` 表，模型配置在同一文件的 `[ai]` 表。
+每组都可以填写字体名称并调整字号。字体名称留空时使用系统字体；AI 对话字体留空时跟随界面字体。下方提供预览，保存后两个窗口会立即使用新设置。外观设置保存在 `settings.json` 的 `appearance` 对象，模型配置在同一文件的 `ai` 对象。
 
 ## 本地 Ollama
 
@@ -47,7 +47,7 @@ Moin 使用 [Rig](https://github.com/0xPlaygrounds/rig) 构建内置 Agent。对
 
 选择「OpenAI 兼容」，填写服务商提供的 API 根地址和模型 ID。根地址通常以 `/v1` 结尾；不要填完整的 `/chat/completions`。此模式使用 Chat Completions 协议，服务需要支持流式响应。
 
-「API Key 环境变量名」填写保存凭据的变量名，例如 `OPENAI_API_KEY`，不要填写密钥本身。Moin 从自己的进程环境读取变量值，`config.toml` 的 `[ai]` 表只保存变量名。远程服务必须提供有效的凭据环境变量；无鉴权的本机兼容服务可以留空。
+「API Key 环境变量名」填写保存凭据的变量名，例如 `OPENAI_API_KEY`，不要填写密钥本身。Moin 从自己的进程环境读取变量值，`settings.json` 的 `ai` 对象只保存变量名。远程服务必须提供有效的凭据环境变量；无鉴权的本机兼容服务可以留空。
 
 例如从终端设置当前会话的变量后启动 Moin：
 
@@ -87,28 +87,34 @@ Windows 使用系统 PowerShell，可执行多行脚本、外部程序，也可�
 
 ## 配置文件
 
-可以在设置中打开数据目录。所有界面设置都保存在数据目录的 `config.toml`：索引目录、快捷键、最近应用、外观、Everything 和 AI 都在同一个文件里。下面是 AI 部分的示例；将 `model` 替换为本机安装的名称：
+可以在设置中打开数据目录。所有界面设置都保存在数据目录的 `settings.json`：索引目录、快捷键、最近应用、外观、Everything 和 AI 都在同一个文件里。下面是 AI 部分的示例；将 `model` 替换为本机安装的名称：
 
-```toml
-[ai]
-provider = "ollama"
-base_url = "http://127.0.0.1:11434"
-model = "qwen2.5:3b"
-api_key_env = "OPENAI_API_KEY"
-system_prompt = ""
-use_local_documents = false
-allow_commands = false
-command_working_directory = ""
+```json
+{
+  "ai": {
+    "provider": "ollama",
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen2.5:3b",
+    "api_key_env": "OPENAI_API_KEY",
+    "system_prompt": "",
+    "use_local_documents": false,
+    "allow_commands": false,
+    "command_working_directory": ""
+  }
+}
 ```
 
-OpenAI 兼容服务的 `provider` 为 `open_ai_compatible`。`system_prompt` 可填写自定义角色指令，留空使用 Moin 的默认角色。界面保存会验证配置；手工修改 `config.toml` 后重启 Moin。旧版本的 `config.json`、`ai.json` 和 `embeddings.json` 会在首次启动时自动合并到 `config.toml`。
+OpenAI 兼容服务的 `provider` 为 `open_ai_compatible`。`system_prompt` 可填写自定义角色指令，留空使用 Moin 的默认角色。界面保存会验证配置；手工修改 `settings.json` 后重启 Moin。
 
 如需 Ollama 神经网络向量检索，可在同一文件添加：
 
-```toml
-[embedding]
-model = "bge-m3"
-endpoint = "http://127.0.0.1:11434/api/embed"
+```json
+{
+  "embedding": {
+    "model": "bge-m3",
+    "endpoint": "http://127.0.0.1:11434/api/embed"
+  }
+}
 ```
 
 普通对话每次请求总超时为 120 秒，启用命令执行后为 10 分钟，回答最多 64,000 字符。连接失败、服务拒绝、模型不存在、超时等情况会在浮窗显示错误，已有应用和文件搜索仍可使用。
