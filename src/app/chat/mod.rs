@@ -639,8 +639,9 @@ impl Render for AiPane {
                 if view.busy {
                     view.stop_ai(cx);
                 } else if !view.detached {
-                    launcher_window::hide(window);
+                    view.set_ai(false, window, cx);
                 }
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|view, _: &NewChat, window, cx| view.new_ai_chat(window, cx)))
             .on_action(cx.listener(|view, _: &Copy, _, cx| view.copy_ai(cx)))

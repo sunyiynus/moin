@@ -57,13 +57,13 @@ python3 scripts/package_macos.py
 | `Ctrl+Shift+C` | 复制路径、带出处的正文片段或插件结果 |
 | `Ctrl+P` | 查看正文片段或返回结果 |
 | `Ctrl+,` | 打开设置 |
-| `Esc` | 收起浮窗到系统托盘 |
+| `Esc` | 后退：关闭操作菜单或正文预览、退出 AI 对话或插件命令；已在搜索页时收起浮窗 |
 
 浮窗使用 Command Palette 布局，单击结果或按 Enter 打开。「更多」菜单可预览正文、复制结果和打开所在文件夹。菜单中可用方向键选择、Enter 执行，Esc 返回结果列表。
 
 ## AI 对话
 
-浮窗内置基于 [Rig](https://github.com/0xPlaygrounds/rig) 的 Agent。点击「AI 对话」或按 `Ctrl+5`（macOS 为 `Cmd+5`）进入对话，在「设置 → AI 助手」配置本机 Ollama 或 OpenAI 兼容模型服务。支持流式回答、多轮追问、停止生成、新对话和复制回答；Markdown 使用 `pulldown-cmark` 解析，并由 GPUI 原生渲染，支持标题、嵌套列表、代码块、引用、表格和链接。模型需由你自行安装或配置。
+浮窗内置基于 [Rig](https://github.com/0xPlaygrounds/rig) 的 Agent。点击「AI 对话」或按 `Ctrl+5`（macOS 为 `Cmd+5`）进入对话，在「设置 → AI 助手」配置本机 Ollama 或 OpenAI 兼容模型服务。支持流式回答、多轮追问、停止生成、新对话和复制回答；Markdown 使用 `pulldown-cmark` 解析，并由 GPUI 原生渲染，支持标题、嵌套列表、代码块、引用、表格和链接。生成中按 `Esc` 停止，空闲时按 `Esc` 返回搜索。模型需由你自行安装或配置。
 
 在「设置 → 外观」可分别指定 AI 对话和其余界面的字体与字号。两项互不影响，保存后立即生效；字体名称留空时使用系统字体，AI 对话则跟随界面字体。
 
@@ -79,11 +79,11 @@ AI 界面左侧支持多个会话，可新建、切换和删除；各会话有�
 
 ## 文件名搜索与 Everything
 
-Windows 上的文件名搜索会优先使用本机 Everything 的索引。Moin 已把 Everything SDK 的 x64 DLL 嵌入 `moin.exe`，首次使用时释放到 Moin 数据目录的 `bin` 文件夹（默认 `%LOCALAPPDATA%\Moin\bin`）并动态加载；本机需要安装并运行 [Everything](https://www.voidtools.com/)。Everything 未安装、未运行或 IPC 不可用时，Moin 会自动回退到自己的 SQLite 文件名索引，搜索不会中断。
+Windows 上的文件名搜索会优先使用本机 Everything 的索引。Moin 已把 Everything SDK 的 x64 DLL 嵌入 `moin.exe`，首次使用时释放到 Moin 数据目录的 `bin` 文件夹（默认 `%LOCALAPPDATA%\Moin\bin`）并动态加载；本机需要安装并运行 [Everything](https://www.voidtools.com/)。启用 Everything 后，文件搜索完全由 Everything 完成；Everything 未安装、未运行或 IPC 不可用时，文件搜索会直接提示失败，可在「设置 → 搜索」中停用 Everything 以改用 Moin 本地索引。
 
-在「设置 → 搜索」可以查看 Everything 连接状态、重新检测或启动 Everything。文件名搜索直接使用 Everything 的索引，不需要设置搜索目录；连接后查询内容会原样交给 Everything，可使用 `ext:`、`path:`、`|` 等 Everything 搜索语法，并按 Everything 的结果顺序显示。
+在「设置 → 搜索」可以查看 Everything 连接状态、重新检测或启动 Everything。文件名搜索直接使用 Everything 的索引，不需要设置搜索目录；查询会直接交给 Everything（仅把 `/` 统一为 Windows 的 `\`），Moin 不做其他查询改写、结果过滤或重排，并保持 Everything 的结果顺序。在「全部」范围中，Moin 只负责把应用和正文结果与 Everything 的文件结果拼接，文件部分本身不做处理。
 
-结果同时包含文件和文件夹，文件夹显示为「文件夹」并可用 `Enter` 直接在资源管理器打开。查询中的 `\`、`/` 或盘符前缀（如 `C:`）会被识别为路径搜索，Moin 会对这类查询启用路径匹配，因此可以直接输入 `C:\Users\me\Documents` 这类完整路径；也可以用 `path:` 显式限定路径，用 `folder:` 只匹配文件夹。
+结果同时包含文件和文件夹，文件夹显示为「文件夹」并可用 `Enter` 直接在资源管理器打开。Everything 的路径匹配始终开启，因此文件名、文件夹、完整路径以及 `ext:`、`path:`、`folder:`、`|` 等 Everything 搜索语法都可以直接使用，例如输入 `C:\Users\me\Documents` 会直接按路径匹配。路径分隔符可以用 `\` 或 `/`：`/` 会在发送给 Everything 前转换为 `\`，`regex:` 查询保持原样。
 
 「设置 → 索引」中配置的目录只用于建立正文和向量索引。Everything 只提供文件名和路径结果，正文和向量检索仍由 Moin 完成。SDK 来源和许可见 `assets/everything/NOTICE.md`。
 

@@ -768,14 +768,30 @@ impl Moin {
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if (self.ai.active) && self.ai.pane.read(cx).busy() && !self.ai.pane.read(cx).composing(cx)
-        {
-            self.stop_ai(cx);
+        if self.ai.active {
+            if self.composing(cx) {
+                return;
+            }
+            if self.ai.pane.read(cx).busy() {
+                self.stop_ai(cx);
+            } else {
+                self.set_ai(false, window, cx);
+            }
             return;
         }
         if self.actions_open {
             self.actions_open = false;
             cx.notify();
+            return;
+        }
+        if self.preview_open {
+            self.preview_open = false;
+            cx.notify();
+            return;
+        }
+        if self.plugins.recognizes(&self.query(cx)) {
+            self.input.update(cx, |input, cx| input.clear(cx));
+            self.refresh(cx);
             return;
         }
         if !self.composing(cx) && !self.folder_picker_open {

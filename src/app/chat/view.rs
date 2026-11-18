@@ -671,7 +671,11 @@ impl AiPane {
                     .text_size(rem(11.))
                     .text_color(rgb(CHAT_MUTED))
                     .child(if self.status.is_empty() {
-                        "Enter 发送 · 对话仅在本次运行中保留".into()
+                        if self.busy {
+                            "Esc 停止生成 · 对话仅在本次运行中保留".into()
+                        } else {
+                            "Enter 发送 · Esc 返回搜索 · 对话仅在本次运行中保留".into()
+                        }
                     } else {
                         self.status.clone()
                     }),

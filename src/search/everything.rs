@@ -2,13 +2,13 @@
 //!
 //! The SDK DLL is embedded in Moin's executable and extracted to the local data
 //! directory on first use. Everything itself is a separate application: Moin
-//! only talks to it over local IPC and falls back to its own index when it is
-//! not running.
+//! only talks to it over local IPC.
 //!
-//! Queries are passed through unchanged, and results include both files and
-//! folders. Queries that look like paths (contain `\`, `/`, or start with a
-//! drive letter) enable Everything's path matching so full paths can be
-//! entered directly.
+//! File search is a direct passthrough: Windows path separators are normalized
+//! (`/` becomes `\`), then the query goes to Everything unchanged and results
+//! are shown in Everything's own order without any Moin-side filtering.
+//! Everything therefore owns the full search syntax, including `ext:`, `path:`,
+//! `folder:` and `|`.
 
 use super::index::{self, Hit, HitKind, SearchMode};
 use anyhow::{Result, bail};
@@ -42,8 +42,11 @@ impl Status {
     }
 }
 
-/// Query the filename index, preferring Everything when it is available.
-/// Filename search is intentionally not limited to the content-index roots.
+/// Query Everything and keep its results untouched.
+///
+/// `All` still prepends local applications and appends content matches, but the
+/// file and folder portion is exactly what Everything returned. `Files` is
+/// Everything only, with no local index fallback.
 pub fn search_with_index(
     database: &Path,
     data_dir: &Path,
@@ -56,33 +59,27 @@ pub fn search_with_index(
         return index::search(database, query, mode, limit);
     }
 
-    // Keep Moin's application results, but use Everything's own result order and
-    // search syntax for filenames.
-    let mut hits = if mode == SearchMode::All {
-        index::search_names(database, query, SearchMode::Apps, limit.min(5))?
-    } else {
-        Vec::new()
-    };
-    let remaining = limit.saturating_sub(hits.len());
-    match search(data_dir, query, remaining) {
-        Ok(files) => {
-            let mut seen = hits
-                .iter()
-                .map(|hit| path_key(&hit.path))
-                .collect::<HashSet<_>>();
-            for hit in files {
-                if hits.len() >= limit {
-                    break;
-                }
-                if seen.insert(path_key(&hit.path)) {
-                    hits.push(hit);
-                }
-            }
-        }
-        Err(_) => return index::search(database, query, mode, limit),
+    if mode == SearchMode::Files {
+        return search(data_dir, query, limit);
     }
 
-    if mode == SearchMode::All && hits.len() < limit {
+    let mut hits = index::search_names(database, query, SearchMode::Apps, limit.min(5))?;
+    let remaining = limit.saturating_sub(hits.len());
+    let files = search(data_dir, query, remaining)?;
+    let mut seen = hits
+        .iter()
+        .map(|hit| path_key(&hit.path))
+        .collect::<HashSet<_>>();
+    for hit in files {
+        if hits.len() >= limit {
+            break;
+        }
+        if seen.insert(path_key(&hit.path)) {
+            hits.push(hit);
+        }
+    }
+
+    if hits.len() < limit {
         let remaining = limit - hits.len();
         match index::retrieve(database, query, remaining) {
             Ok(text) => append_text(&mut hits, text, limit),
@@ -118,20 +115,16 @@ fn path_key(path: &Path) -> String {
     key.to_lowercase()
 }
 
-fn internal_path(path: &Path, data_dir: &Path) -> bool {
-    let key = path_key(path);
-    let data_dir = path_key(data_dir);
-    !data_dir.is_empty() && (key == data_dir || key.starts_with(&format!("{data_dir}\\")))
-}
-
-fn looks_like_path(query: &str) -> bool {
-    let query = query.trim();
-    query.contains(['\\', '/'])
-        || (query.as_bytes().get(1) == Some(&b':')
-            && query
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic()))
+/// Everything only treats `\` as a Windows path separator. Accept `/` from
+/// users by translating it, while leaving Everything's search syntax alone.
+/// Regular expressions are passed through untouched so escapes keep working.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn normalize_query(query: &str) -> String {
+    if query.to_ascii_lowercase().contains("regex:") {
+        query.to_owned()
+    } else {
+        query.replace('/', "\\")
+    }
 }
 
 pub fn status(data_dir: &Path) -> Status {
@@ -258,15 +251,16 @@ mod platform {
         let _guard = QUERY_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let wide: Vec<u16> = query
-            .trim()
+        let wide: Vec<u16> = normalize_query(query.trim())
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         let max = limit as u32;
         unsafe {
             (api.set_search)(wide.as_ptr());
-            (api.set_match_path)(i32::from(looks_like_path(query)));
+            // Everything owns matching: path matching stays on so filenames,
+            // folders, full paths and Everything's own functions all work.
+            (api.set_match_path)(1);
             (api.set_match_case)(0);
             (api.set_regex)(0);
             (api.set_request_flags)(REQUEST_FILE_NAME | REQUEST_PATH);
@@ -286,9 +280,6 @@ mod platform {
                 let Some(path) = result_path(api, index) else {
                     continue;
                 };
-                if internal_path(&path, data_dir) {
-                    continue;
-                }
                 let title = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -506,36 +497,13 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
-    fn recognizes_path_queries_without_mistaking_search_filters() {
-        assert!(looks_like_path("C:\\Users\\me"));
-        assert!(looks_like_path("C:/Users/me"));
-        assert!(looks_like_path("C:"));
-        assert!(looks_like_path("Documents/report"));
-        assert!(!looks_like_path("ext:md"));
-        assert!(!looks_like_path("path:Documents report"));
-        assert!(!looks_like_path("report"));
-    }
-
-    #[test]
-    fn excludes_moin_data_directory() {
-        let data_dir = Path::new("C:\\Users\\me\\AppData\\Moin");
-        assert!(internal_path(
-            Path::new("C:\\Users\\me\\AppData\\Moin\\index.sqlite3"),
-            data_dir
-        ));
-        assert!(internal_path(
-            Path::new("\\\\?\\C:\\Users\\me\\AppData\\Moin\\bin\\Everything64.dll"),
-            data_dir
-        ));
-        assert!(!internal_path(
-            Path::new("C:\\Users\\me\\Documents\\note.txt"),
-            data_dir
-        ));
-        assert!(!internal_path(
-            Path::new("C:\\Users\\me\\AppData\\MoinExtra\\note.txt"),
-            data_dir
-        ));
+    fn accepts_forward_slashes_in_path_queries() {
+        assert_eq!(normalize_query("moin/target"), "moin\\target");
+        assert_eq!(normalize_query("C:/Users/me"), "C:\\Users\\me");
+        assert_eq!(normalize_query("ext:md report"), "ext:md report");
+        assert_eq!(normalize_query("regex:moin/[a-z]+"), "regex:moin/[a-z]+");
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -563,13 +531,17 @@ mod tests {
     #[ignore = "requires Everything to be installed and running"]
     fn returns_folders_for_path_queries() {
         let data_dir = tempfile::tempdir().unwrap();
-        let hits = search(data_dir.path(), "C:\\Program Files\\Everything", 50).unwrap();
-        assert!(
-            hits.iter()
-                .any(|hit| hit.kind == HitKind::Folder
+        for query in [
+            "C:\\Program Files\\Everything",
+            "C:/Program Files/Everything",
+        ] {
+            let hits = search(data_dir.path(), query, 50).unwrap();
+            assert!(
+                hits.iter().any(|hit| hit.kind == HitKind::Folder
                     && hit.title.eq_ignore_ascii_case("Everything")),
-            "no folder result: {hits:?}"
-        );
+                "no folder result for {query:?}: {hits:?}"
+            );
+        }
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
