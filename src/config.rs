@@ -1,3 +1,4 @@
+use crate::ai::AiConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -5,8 +6,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const CONFIG_FILE: &str = "config.toml";
+const LEGACY_CONFIG_FILE: &str = "config.json";
+const LEGACY_AI_FILE: &str = "ai.json";
+const LEGACY_EMBEDDING_FILE: &str = "embeddings.json";
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default = "crate::search::index::default_roots")]
     pub roots: Vec<PathBuf>,
     #[serde(default = "crate::hotkey::default_shortcut")]
     pub activation_hotkey: String,
@@ -16,6 +23,24 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub everything: EverythingConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            roots: crate::search::index::default_roots(),
+            activation_hotkey: crate::hotkey::default_shortcut(),
+            recent_apps: Vec::new(),
+            appearance: AppearanceConfig::default(),
+            everything: EverythingConfig::default(),
+            ai: AiConfig::default(),
+            embedding: None,
+        }
+    }
 }
 
 pub const UI_FONT_SIZE_MIN: f32 = 12.0;
@@ -76,6 +101,29 @@ impl Default for EverythingConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub model: String,
+    #[serde(default = "default_embedding_endpoint")]
+    pub endpoint: String,
+    pub dimensions: Option<usize>,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            endpoint: default_embedding_endpoint(),
+            dimensions: None,
+        }
+    }
+}
+
+fn default_embedding_endpoint() -> String {
+    "http://127.0.0.1:11434/api/embed".into()
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct RecentApp {
     pub title: String,
@@ -94,29 +142,61 @@ pub fn data_dir() -> Result<PathBuf> {
 
 impl Config {
     pub fn load(home: &Path) -> Result<Self> {
-        match fs::read(home.join("config.json")) {
-            Ok(bytes) => {
+        let path = home.join(CONFIG_FILE);
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
                 let mut config: Self =
-                    serde_json::from_slice(&bytes).context("无法读取 config.json")?;
+                    toml::from_str(text).with_context(|| format!("无法读取 {}", path.display()))?;
                 config.appearance = config.appearance.normalized();
                 Ok(config)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                roots: crate::search::index::default_roots(),
-                activation_hotkey: crate::hotkey::default_shortcut(),
-                recent_apps: Vec::new(),
-                appearance: AppearanceConfig::default(),
-                everything: EverythingConfig::default(),
-            }),
-            Err(error) => Err(error).context("无法读取 config.json"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::migrate(home),
+            Err(error) => Err(error).with_context(|| format!("无法读取 {}", path.display())),
         }
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
-        let path = home.join("config.json");
-        let temporary = home.join("config.json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        fs::create_dir_all(home).context("无法创建 Moin 数据目录")?;
+        let path = home.join(CONFIG_FILE);
+        let temporary = home.join("config.toml.tmp");
+        let text = toml::to_string_pretty(self).context("无法序列化 Moin 设置")?;
+        fs::write(&temporary, text).context("无法写入 Moin 设置")?;
         fs::rename(temporary, path).context("无法保存 Moin 设置")
+    }
+
+    /// Read the old split config files once and convert them to config.toml.
+    fn migrate(home: &Path) -> Result<Self> {
+        let mut config = Self::default();
+        match fs::read(home.join(LEGACY_CONFIG_FILE)) {
+            Ok(bytes) => {
+                config = serde_json::from_slice(&bytes).context("无法读取旧版 config.json 设置")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("无法读取旧版 config.json 设置"),
+        }
+        match fs::read(home.join(LEGACY_AI_FILE)) {
+            Ok(bytes) => {
+                if let Ok(ai) = serde_json::from_slice::<AiConfig>(&bytes) {
+                    config.ai = ai;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("无法读取旧版 ai.json 设置"),
+        }
+        match fs::read(home.join(LEGACY_EMBEDDING_FILE)) {
+            Ok(bytes) => {
+                if let Ok(embedding) = serde_json::from_slice::<EmbeddingConfig>(&bytes) {
+                    config.embedding = Some(embedding);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("无法读取旧版 embeddings.json 设置"),
+        }
+        config.appearance = config.appearance.normalized();
+        // Best effort: the app can still run while the directory is read-only.
+        let _ = config.save(home);
+        Ok(config)
     }
 }
 
@@ -125,20 +205,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_old_settings_and_round_trips_configured_hotkey() -> Result<()> {
-        let mut config: Config = serde_json::from_str(r#"{"roots":[]}"#)?;
+    fn round_trips_settings_through_toml() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let mut config = Config::load(folder.path())?;
         assert_eq!(config.activation_hotkey, "Alt+Space");
         assert_eq!(config.appearance, AppearanceConfig::default());
         assert!(config.everything.enabled);
         config.activation_hotkey = "Ctrl+Shift+K".into();
         config.appearance.ui_font_size = 18.0;
         config.appearance.ai_font_family = "Microsoft YaHei UI".into();
-        let restored: Config = serde_json::from_str(&serde_json::to_string(&config)?)?;
+        config.ai.model = "qwen2.5:3b".into();
+        config.embedding = Some(EmbeddingConfig {
+            model: "bge-m3".into(),
+            endpoint: default_embedding_endpoint(),
+            dimensions: Some(1024),
+        });
+        config.recent_apps.push(RecentApp {
+            title: "Moin".into(),
+            path: PathBuf::from("C:\\Tools\\Moin.exe"),
+        });
+        config.save(folder.path())?;
+
+        let restored = Config::load(folder.path())?;
         assert_eq!(restored.activation_hotkey, "Ctrl+Shift+K");
         assert_eq!(restored.appearance.ui_font_size, 18.0);
         assert_eq!(restored.appearance.ai_font_family, "Microsoft YaHei UI");
+        assert_eq!(restored.ai.model, "qwen2.5:3b");
+        assert_eq!(
+            restored
+                .embedding
+                .as_ref()
+                .map(|value| value.model.as_str()),
+            Some("bge-m3")
+        );
         assert!(restored.everything.enabled);
-        assert!(restored.recent_apps.is_empty());
+        assert_eq!(restored.recent_apps.len(), 1);
+        assert_eq!(restored.recent_apps[0].title, "Moin");
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_legacy_json_settings() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        fs::write(
+            folder.path().join("config.json"),
+            r#"{"roots":["C:\\Docs"],"activation_hotkey":"Ctrl+Alt+M"}"#,
+        )?;
+        fs::write(
+            folder.path().join("ai.json"),
+            r#"{
+                "provider": "ollama",
+                "base_url": "http://127.0.0.1:11434",
+                "model": "qwen2.5:3b",
+                "api_key_env": "OPENAI_API_KEY",
+                "system_prompt": "自定义角色",
+                "use_local_documents": true,
+                "allow_commands": false,
+                "command_working_directory": ""
+            }"#,
+        )?;
+        fs::write(
+            folder.path().join("embeddings.json"),
+            r#"{"model":"bge-m3","endpoint":"http://127.0.0.1:11434/api/embed","dimensions":1024}"#,
+        )?;
+        let config = Config::load(folder.path())?;
+        assert_eq!(config.activation_hotkey, "Ctrl+Alt+M");
+        assert_eq!(config.ai.model, "qwen2.5:3b");
+        assert_eq!(config.ai.system_prompt, "自定义角色");
+        assert!(config.ai.use_local_documents);
+        assert_eq!(
+            config.embedding.as_ref().map(|value| value.model.as_str()),
+            Some("bge-m3")
+        );
+        assert!(folder.path().join("config.toml").is_file());
+
+        let reloaded = Config::load(folder.path())?;
+        assert_eq!(reloaded.ai.model, "qwen2.5:3b");
+        assert_eq!(reloaded.activation_hotkey, "Ctrl+Alt+M");
+        assert_eq!(
+            reloaded
+                .embedding
+                .as_ref()
+                .map(|value| value.model.as_str()),
+            Some("bge-m3")
+        );
         Ok(())
     }
 

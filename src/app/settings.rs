@@ -1281,6 +1281,9 @@ impl Settings {
                                 .on_click(move |_, _, cx| cx.open_with_system(&directory)),
                         ),
                     )
+                    .child(description(
+                        "所有界面设置统一保存在数据目录的 config.toml。",
+                    ))
                     .child(
                         setting_row(
                             "\u{e8a5}",

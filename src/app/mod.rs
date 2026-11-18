@@ -168,13 +168,8 @@ impl Moin {
                     .map(|(prefix, description)| Command::Plugin(prefix, description)),
             )
             .collect();
-        let (ai_config, ai_error) = match moin::ai::AiConfig::load(&home) {
-            Ok(config) => (config, None),
-            Err(error) => (
-                Default::default(),
-                Some(format!("无法读取 AI 设置 · {error:#}")),
-            ),
-        };
+        let ai_config = config.ai.clone();
+        let ai_error = None;
         let ai = chat::AiChat::new(
             cx,
             &config.appearance,

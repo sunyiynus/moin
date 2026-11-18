@@ -1,13 +1,14 @@
+use crate::config::EmbeddingConfig;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read},
     path::Path,
     time::Duration,
 };
 
-const CONFIG: &str = "embeddings.json";
+const LEGACY_CONFIG: &str = "embeddings.json";
 const LOCAL_DIMENSIONS: usize = 384;
 const MAX_DIMENSIONS: usize = 8192;
 const MAX_INPUT_BYTES: usize = 16 * 1024;
@@ -40,17 +41,9 @@ impl EmbeddingProfile {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaConfig {
-    model: String,
-    #[serde(default = "default_endpoint")]
-    endpoint: String,
+struct ConfigDocument {
     #[serde(default)]
-    dimensions: Option<usize>,
-}
-
-fn default_endpoint() -> String {
-    "http://127.0.0.1:11434/api/embed".into()
+    embedding: Option<EmbeddingConfig>,
 }
 
 pub struct Embeddings {
@@ -60,7 +53,24 @@ pub struct Embeddings {
 
 impl Embeddings {
     pub fn load(home: &Path) -> Result<Self> {
-        let path = home.join(CONFIG);
+        let config_path = home.join("config.toml");
+        if config_path.is_file() {
+            let text = fs::read_to_string(&config_path)
+                .with_context(|| format!("无法读取 {}", config_path.display()))?;
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            let document: ConfigDocument = toml::from_str(text)
+                .with_context(|| format!("无法读取 {}", config_path.display()))?;
+            if let Some(config) = document.embedding {
+                return Self::from_profile(EmbeddingProfile::OllamaV1 {
+                    model: config.model,
+                    endpoint: config.endpoint,
+                    dimensions: config.dimensions,
+                })
+                .with_context(|| format!("{} 的 [embedding] 配置有误", config_path.display()));
+            }
+        }
+
+        let path = home.join(LEGACY_CONFIG);
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -70,7 +80,7 @@ impl Embeddings {
                 return Err(error).with_context(|| format!("无法读取 {}", path.display()));
             }
         };
-        let config: OllamaConfig = (|| {
+        let config: EmbeddingConfig = (|| {
             let bytes = read_limited(file, 4096)?;
             let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
             serde_json::from_slice(bytes).context("JSON 格式有误")
@@ -340,6 +350,25 @@ mod tests {
     };
 
     #[test]
+    fn loads_embedding_profile_from_config_toml() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        fs::write(
+            folder.path().join("config.toml"),
+            "[embedding]\nmodel = \"bge-m3\"\nendpoint = \"http://127.0.0.1:11434/api/embed\"\ndimensions = 1024\n",
+        )?;
+        let provider = Embeddings::load(folder.path())?;
+        assert_eq!(
+            provider.profile(),
+            &EmbeddingProfile::OllamaV1 {
+                model: "bge-m3".into(),
+                endpoint: "http://127.0.0.1:11434/api/embed".into(),
+                dimensions: Some(1024),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn local_vectors_rank_shared_chinese_terms() -> Result<()> {
         let provider = Embeddings::from_profile(EmbeddingProfile::LocalLexicalV1)?;
         let vectors = provider.embed(&[
@@ -362,7 +391,7 @@ mod tests {
     #[test]
     fn pins_validated_loopback_profile() -> Result<()> {
         let endpoint = local_endpoint(" http://localhost:11434/api/embed ")?;
-        assert_eq!(endpoint, default_endpoint());
+        assert_eq!(endpoint, EmbeddingConfig::default().endpoint);
         assert!(local_endpoint("http://192.0.2.1:11434/api/embed").is_err());
         assert!(local_endpoint("http://127.0.0.1:11434/api/embed?redirect=1").is_err());
         let profile = EmbeddingProfile::OllamaV1 {
@@ -376,7 +405,7 @@ mod tests {
             assert!(
                 Embeddings::from_profile(EmbeddingProfile::OllamaV1 {
                     model: model.into(),
-                    endpoint: default_endpoint(),
+                    endpoint: EmbeddingConfig::default().endpoint,
                     dimensions: None,
                 })
                 .is_err()

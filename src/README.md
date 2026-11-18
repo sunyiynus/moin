@@ -32,7 +32,7 @@ src/
 │   ├── embedding.rs
 │   └── vector_store.rs
 ├── bin/moin-cli.rs      # CLI / MCP
-├── config.rs            # 配置读写（跨领域）
+├── config.rs            # 配置读写：config.toml，含旧 JSON 迁移
 ├── hotkey.rs            # 快捷键解析与注册（跨领域）
 ├── lib.rs               # 后端库入口
 └── main.rs              # 桌面应用入口

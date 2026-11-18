@@ -12,9 +12,7 @@ use rig::{
 use rig_agent::{AgentBuilder, agent::MultiTurnStreamItem};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
-    io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -25,7 +23,6 @@ const MAX_OUTPUT_CHARS: usize = 64_000;
 const MAX_HISTORY_CHARS: usize = 48_000;
 const MAX_HISTORY_MESSAGES: usize = 24;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONFIG_FILE: &str = "ai.json";
 mod commands;
 pub use commands::{CommandReport, CommandRequest};
 
@@ -66,29 +63,6 @@ impl Default for AiConfig {
 }
 
 impl AiConfig {
-    pub fn load(home: &Path) -> Result<Self> {
-        let file = match File::open(home.join(CONFIG_FILE)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error).context("无法读取 AI 设置"),
-        };
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 64 * 1024, "AI 设置文件过大");
-        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-        serde_json::from_slice(bytes).context("ai.json 格式有误")
-    }
-
-    pub fn save(&self, home: &Path) -> Result<()> {
-        self.validate()?;
-        fs::create_dir_all(home).context("无法创建 AI 设置目录")?;
-        let temporary = home.join("ai.json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?).context("无法写入 AI 设置")?;
-        fs::rename(&temporary, home.join(CONFIG_FILE)).context("无法保存 AI 设置")
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.allow_commands {
             commands::working_directory(&self.command_working_directory)?;

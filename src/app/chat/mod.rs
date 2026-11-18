@@ -709,8 +709,17 @@ impl Moin {
         self.ai.pane.update(cx, |pane, cx| pane.copy_ai(cx));
     }
     pub fn save_ai_config(&mut self, config: AiConfig, cx: &mut Context<Self>) {
-        match config.save(&self.home) {
+        if let Err(error) = config.validate() {
+            self.ai_error = Some(format!("AI 设置未保存 · {error:#}"));
+            self.ai_notice = None;
+            cx.notify();
+            return;
+        }
+        let mut app_config = self.config.clone();
+        app_config.ai = config.clone();
+        match app_config.save(&self.home) {
             Ok(()) => {
+                self.config = app_config;
                 self.ai_config = config.clone();
                 self.ai_error = None;
                 self.ai_notice = Some("AI 设置已保存，后续提问使用新配置。".into());

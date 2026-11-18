@@ -271,6 +271,7 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[cfg(windows)]
     #[tokio::test]
     async fn dropping_execution_terminates_spawned_descendants() {

@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::{Value, json};
 use std::{
+    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc,
@@ -266,17 +267,22 @@ fn output(events: &[ChatEvent]) -> String {
 
 #[test]
 fn settings_round_trip_and_reject_credentials_in_urls() {
+    use crate::config::Config;
+
     let folder = tempfile::tempdir().unwrap();
-    let mut config = AiConfig::load(folder.path()).unwrap();
-    assert!(!config.use_local_documents);
-    assert!(config.validate().is_err());
-    config.model = "local-installed-model".into();
-    config.system_prompt = "用中文回答".into();
+    let mut config = Config::load(folder.path()).unwrap();
+    let mut ai = config.ai.clone();
+    assert!(!ai.use_local_documents);
+    assert!(ai.validate().is_err());
+    ai.model = "local-installed-model".into();
+    ai.system_prompt = "用中文回答".into();
+    config.ai = ai.clone();
     config.save(folder.path()).unwrap();
-    assert_eq!(AiConfig::load(folder.path()).unwrap(), config);
-    config.model = "second-model".into();
+    assert_eq!(Config::load(folder.path()).unwrap().ai, ai);
+    ai.model = "second-model".into();
+    config.ai = ai.clone();
     config.save(folder.path()).unwrap();
-    assert_eq!(AiConfig::load(folder.path()).unwrap(), config);
+    assert_eq!(Config::load(folder.path()).unwrap().ai, ai);
     for base in [
         "file:///tmp",
         "http://user:secret@localhost",
@@ -284,14 +290,14 @@ fn settings_round_trip_and_reject_credentials_in_urls() {
         "http://localhost#secret",
         "ftp://example.org",
     ] {
-        config.base_url = base.into();
-        assert!(config.validate().is_err(), "{base}");
+        ai.base_url = base.into();
+        assert!(ai.validate().is_err(), "{base}");
     }
-    config.base_url = "http://127.0.0.1:11434/api".into();
-    assert!(config.validate().is_err());
-    config.base_url = "http://127.0.0.1:11434".into();
-    config.api_key_env = "sk-actual-key".into();
-    assert!(config.validate().is_err());
+    ai.base_url = "http://127.0.0.1:11434/api".into();
+    assert!(ai.validate().is_err());
+    ai.base_url = "http://127.0.0.1:11434".into();
+    ai.api_key_env = "sk-actual-key".into();
+    assert!(ai.validate().is_err());
 }
 
 #[test]
