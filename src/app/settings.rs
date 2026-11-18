@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use gpui::{prelude::*, *};
 
-use crate::{
+use super::{
+    Moin,
     appearance::rem,
-    everything,
     input::{Changed, SearchInput},
-    ui::Moin,
 };
+use moin::search::everything;
 use moin::{
     ai::{AiConfig, AiProvider},
     config::{
@@ -74,6 +74,7 @@ pub struct Snapshot {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    Search,
     Index,
     Plugins,
     Ai,
@@ -84,7 +85,8 @@ enum Page {
 impl Page {
     fn label(self) -> &'static str {
         match self {
-            Self::Index => "搜索与索引",
+            Self::Search => "搜索",
+            Self::Index => "索引",
             Self::Plugins => "扩展插件",
             Self::Ai => "AI 助手",
             Self::Appearance => "外观",
@@ -94,7 +96,14 @@ impl Page {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Index => "选择要纳入文件名和正文搜索的目录。",
+            Self::Search => {
+                if cfg!(windows) {
+                    "文件名搜索使用 Everything，不需要设置搜索范围。"
+                } else {
+                    "当前平台使用 Moin 本地索引检索文件名。"
+                }
+            }
+            Self::Index => "选择需要建立正文索引的目录。",
             Self::Plugins => "查看可用命令，安装和管理本地扩展。",
             Self::Ai => "配置浮窗对话使用的模型，以及本地文档检索。",
             Self::Appearance => "分别调整 AI 对话与其余界面的字体和字号。",
@@ -104,7 +113,8 @@ impl Page {
 
     fn icon(self) -> &'static str {
         match self {
-            Self::Index => "\u{e8b7}",
+            Self::Search => "\u{e721}",
+            Self::Index => "\u{e8a5}",
             Self::Plugins => "\u{ea86}",
             Self::Ai => "\u{e8f2}",
             Self::Appearance => "\u{e8d2}",
@@ -261,8 +271,9 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.launcher.read(cx).settings_snapshot();
         window.set_rem_size(px(snapshot.appearance.ui_font_size));
-        let ui_font_family = crate::appearance::resolve_family(&snapshot.appearance.ui_font_family);
+        let ui_font_family = super::appearance::resolve_family(&snapshot.appearance.ui_font_family);
         let content = match self.page {
+            Page::Search => self.search_page(snapshot, cx),
             Page::Index => self.index_page(snapshot, cx),
             Page::Plugins => self.plugins_page(snapshot),
             Page::Ai => self.ai_page(snapshot, cx),
@@ -392,6 +403,7 @@ impl Settings {
                         [
                             Page::App,
                             Page::Appearance,
+                            Page::Search,
                             Page::Index,
                             Page::Ai,
                             Page::Plugins,
@@ -440,6 +452,23 @@ impl Settings {
             )
     }
 
+    fn search_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
+        let enabled = snapshot.everything_enabled;
+        let status = snapshot.everything_status.clone();
+        let error = snapshot.everything_error.clone();
+        if cfg!(windows) {
+            column()
+                .gap(px(24.))
+                .child(self.everything_section(enabled, &status, error, cx))
+        } else {
+            column().gap(px(24.)).child(section("文件名搜索").child(
+                card().px(px(20.)).py(px(16.)).child(description(
+                    "当前平台使用 Moin 本地索引检索文件名；Everything 仅在 Windows 上可用。",
+                )),
+            ))
+        }
+    }
+
     fn index_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
         let idle = !snapshot.indexing && !snapshot.folder_picker_open;
         let status = if snapshot.indexing {
@@ -455,9 +484,6 @@ impl Settings {
             .counts
             .map(|(apps, files, chunks)| [apps, files, chunks]);
         let has_roots = !snapshot.roots.is_empty();
-        let everything_enabled = snapshot.everything_enabled;
-        let everything_status = snapshot.everything_status.clone();
-        let everything_error = snapshot.everything_error.clone();
         column()
             .gap(px(24.))
             .child(
@@ -508,21 +534,13 @@ impl Settings {
                     })
                     .children(snapshot.error.into_iter().map(error_message)),
             )
-            .when(cfg!(windows), |column| {
-                column.child(self.everything_section(
-                    everything_enabled,
-                    &everything_status,
-                    everything_error,
-                    cx,
-                ))
-            })
             .child(
-                section("搜索目录")
+                section("索引目录")
                     .child(
                         setting_row(
-                            "\u{e8b7}",
-                            "添加搜索目录",
-                            "将文件夹中的文件与可读取的正文加入索引。",
+                            "\u{e8a5}",
+                            "添加索引目录",
+                            "将文件夹中的文件正文加入索引；正文检索需要这些目录。",
                         )
                         .child(
                             button("add-root", "添加目录", false, idle).when(idle, |control| {
@@ -534,9 +552,11 @@ impl Settings {
                         ),
                     )
                     .when(!has_roots, |section| {
-                        section.child(description(
-                            "尚未添加目录。添加目录后，可在浮窗中搜索文件和正文。",
-                        ))
+                        section.child(description(if cfg!(windows) {
+                            "尚未添加索引目录。添加后，可检索文件正文和向量片段；文件名搜索仍可直接使用 Everything。"
+                        } else {
+                            "尚未添加索引目录。添加后，可检索文件正文和向量片段。"
+                        }))
                     })
                     .children(snapshot.roots.into_iter().enumerate().map(|(index, root)| {
                         let name = root
@@ -544,7 +564,7 @@ impl Settings {
                             .unwrap_or(root.as_os_str())
                             .to_string_lossy()
                             .into_owned();
-                        setting_row("\u{e8b7}", name, root.to_string_lossy().into_owned()).child(
+                        setting_row("\u{e8a5}", name, root.to_string_lossy().into_owned()).child(
                             button(("remove-root", index), "移除目录", false, idle).when(
                                 idle,
                                 |control| {
@@ -573,8 +593,8 @@ impl Settings {
             .child(
                 setting_row(
                     "\u{e8b7}",
-                    "Everything 文件名索引",
-                    "使用本机 Everything 的文件名索引；SDK 已随 Moin 打包，未连接时自动回退本地索引。",
+                    "Everything 文件名搜索",
+                    "直接使用 Everything 的文件名索引，无需设置搜索目录；未连接时自动回退本地索引。",
                 )
                 .id("everything-toggle")
                 .tab_index(0)
@@ -613,7 +633,7 @@ impl Settings {
                             .min_w_0()
                             .gap(px(10.))
                             .child(div().size(px(7.)).flex_shrink_0().rounded_full().bg(rgb(color)))
-                            .child(div().min_w_0().child(description(label))),
+                            .child(div().child(description(label))),
                     )
                     .child(
                         row()
@@ -803,8 +823,8 @@ impl Settings {
     fn appearance_page(&self, _snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
         let dirty = self.appearance_dirty(cx);
         let draft = self.appearance_draft(cx);
-        let ai_style = crate::ui::markdown::MarkdownStyle {
-            font_family: crate::appearance::resolve_ai_family(&draft),
+        let ai_style = super::chat::markdown::MarkdownStyle {
+            font_family: super::appearance::resolve_ai_family(&draft),
             font_size: draft.ai_font_size,
             line_height: draft.ai_font_size * 1.62,
             text_color: INK,
@@ -842,7 +862,7 @@ impl Settings {
                             .child(description("界面预览"))
                             .child(
                                 div()
-                                    .font_family(crate::appearance::resolve_family(
+                                    .font_family(super::appearance::resolve_family(
                                         &draft.ui_font_family,
                                     ))
                                     .text_size(px(draft.ui_font_size))
@@ -876,7 +896,7 @@ impl Settings {
                             .p(px(20.))
                             .gap(px(16.))
                             .child(description("Markdown 预览"))
-                            .child(crate::ui::markdown::render(
+                            .child(super::chat::markdown::render(
                                 APPEARANCE_MARKDOWN_PREVIEW,
                                 &ai_style,
                             )),
@@ -1441,7 +1461,7 @@ fn input_field(
 }
 
 fn icon(glyph: &'static str, size: f32, color: u32) -> Div {
-    crate::appearance::icon(glyph, size, color)
+    super::appearance::icon(glyph, size, color)
 }
 
 fn command_label(text: impl Into<SharedString>) -> Div {

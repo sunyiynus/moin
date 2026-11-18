@@ -77,6 +77,7 @@ pub fn icon(symbol: &'static str, size: f32, color: u32) -> Div {
 fn icon_path(symbol: &str) -> &'static str {
     match symbol {
         "\u{e8f2}" => "icons/chat",
+        "\u{e721}" => "icons/search",
         "\u{e713}" => "icons/settings",
         "\u{e8d2}" => "icons/type",
         "\u{e8b7}" | "\u{e838}" => "icons/folder",
@@ -98,6 +99,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         let paths = match path {
             "icons/chat" => "<path d='M4 3h16v13H9l-5 5z'/><path d='M8 7h8M8 11h6'/>",
+            "icons/search" => "<circle cx='11' cy='11' r='7'/><path d='m16 16 5 5'/>",
             "icons/settings" => {
                 "<circle cx='12' cy='12' r='3'/><path d='m10 3 4 0 .5 3 2 1.2 3-.8 2 3.5-2.5 2 0 2.2 2.5 2-2 3.5-3-.8-2 1.2-.5 3h-4l-.5-3-2-1.2-3 .8-2-3.5 2.5-2v-2.2l-2.5-2 2-3.5 3 .8 2-1.2z'/>"
             }

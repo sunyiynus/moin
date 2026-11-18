@@ -1,8 +1,9 @@
 use super::*;
-use crate::appearance::rem;
+use super::{appearance::rem, launcher_window, settings};
 use moin::ai::{self, AiConfig, CancelToken, ChatEvent, ChatMessage, ChatRole, Source};
 use moin::config::AppearanceConfig;
 use std::collections::HashMap;
+pub(crate) mod markdown;
 mod view;
 
 // Only data and request lifetimes live here. No render elements, input entities,
@@ -607,7 +608,7 @@ impl Render for AiPane {
             .flex()
             .flex_col()
             .text_color(rgb(CHAT_INK))
-            .font_family(crate::appearance::resolve_family(
+            .font_family(super::appearance::resolve_family(
                 &self.appearance.ui_font_family,
             ))
             .when(self.detached, |root| {

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use moin::{config, index, index::MAX_QUERY_CHARS};
+use moin::{
+    config,
+    search::index::{self, MAX_QUERY_CHARS},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};

@@ -102,7 +102,7 @@ impl Config {
                 Ok(config)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                roots: crate::index::default_roots(),
+                roots: crate::search::index::default_roots(),
                 activation_hotkey: crate::hotkey::default_shortcut(),
                 recent_apps: Vec::new(),
                 appearance: AppearanceConfig::default(),

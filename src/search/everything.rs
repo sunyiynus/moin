@@ -5,8 +5,8 @@
 //! only talks to it over local IPC and falls back to its own index when it is
 //! not running.
 
+use super::index::{self, Hit, HitKind, SearchMode};
 use anyhow::{Result, bail};
-use moin::index::{self, Hit, HitKind, SearchMode};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -38,13 +38,13 @@ impl Status {
 }
 
 /// Query the filename index, preferring Everything when it is available.
+/// Filename search is intentionally not limited to the content-index roots.
 pub fn search_with_index(
     database: &Path,
     data_dir: &Path,
     query: &str,
     mode: SearchMode,
     limit: usize,
-    roots: &[PathBuf],
 ) -> Result<Vec<Hit>> {
     if limit == 0 || !matches!(mode, SearchMode::All | SearchMode::Files) || query.trim().is_empty()
     {
@@ -53,7 +53,7 @@ pub fn search_with_index(
 
     let overfetch = limit.saturating_mul(2).max(limit);
     let mut names = index::search_names(database, query, mode, overfetch)?;
-    match search(data_dir, query, limit, roots) {
+    match search(data_dir, query, limit) {
         Ok(external) => names = merge_names(names, external, query, limit),
         Err(_) => names.truncate(limit),
     }
@@ -129,17 +129,10 @@ fn path_key(path: &Path) -> String {
     key.to_lowercase()
 }
 
-fn in_roots(path: &Path, roots: &[PathBuf], data_dir: &Path) -> bool {
+fn internal_path(path: &Path, data_dir: &Path) -> bool {
     let key = path_key(path);
     let data_dir = path_key(data_dir);
-    if !data_dir.is_empty() && (key == data_dir || key.starts_with(&format!("{data_dir}\\"))) {
-        return false;
-    }
-    roots.iter().any(|root| {
-        let root = path_key(root);
-        let root = root.trim_end_matches('\\');
-        !root.is_empty() && (key == root || key.starts_with(&format!("{root}\\")))
-    })
+    !data_dir.is_empty() && (key == data_dir || key.starts_with(&format!("{data_dir}\\")))
 }
 
 fn escaped_query(query: &str) -> String {
@@ -150,8 +143,8 @@ pub fn status(data_dir: &Path) -> Status {
     platform::status(data_dir)
 }
 
-pub fn search(data_dir: &Path, query: &str, limit: usize, roots: &[PathBuf]) -> Result<Vec<Hit>> {
-    platform::search(data_dir, query, limit, roots)
+pub fn search(data_dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    platform::search(data_dir, query, limit)
 }
 
 pub fn start() -> Result<PathBuf> {
@@ -175,7 +168,7 @@ mod platform {
         core::{PCSTR, PCWSTR},
     };
 
-    const DLL_BYTES: &[u8] = include_bytes!("../assets/everything/Everything64.dll");
+    const DLL_BYTES: &[u8] = include_bytes!("../../assets/everything/Everything64.dll");
     const DLL_FILE: &str = "Everything64-sdk2.dll";
     const ERROR_IPC: u32 = 2;
     const REQUEST_FILE_NAME: u32 = 1;
@@ -260,13 +253,8 @@ mod platform {
         }
     }
 
-    pub(super) fn search(
-        data_dir: &Path,
-        query: &str,
-        limit: usize,
-        roots: &[PathBuf],
-    ) -> Result<Vec<Hit>> {
-        if limit == 0 || query.trim().is_empty() || roots.is_empty() {
+    pub(super) fn search(data_dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
         let api = api(data_dir).map_err(anyhow::Error::msg)?;
@@ -302,7 +290,7 @@ mod platform {
                 let Some(path) = result_path(api, index) else {
                     continue;
                 };
-                if !in_roots(&path, roots, data_dir) {
+                if internal_path(&path, data_dir) {
                     continue;
                 }
                 let title = path
@@ -487,7 +475,7 @@ mod platform {
         Status::Unavailable("Everything SDK 目前仅支持 64 位 Windows".into())
     }
 
-    pub(super) fn search(_: &Path, _: &str, _: usize, _: &[PathBuf]) -> Result<Vec<Hit>> {
+    pub(super) fn search(_: &Path, _: &str, _: usize) -> Result<Vec<Hit>> {
         bail!("Everything 文件搜索目前仅支持 64 位 Windows")
     }
 
@@ -504,7 +492,7 @@ mod platform {
         Status::Unsupported
     }
 
-    pub(super) fn search(_: &Path, _: &str, _: usize, _: &[PathBuf]) -> Result<Vec<Hit>> {
+    pub(super) fn search(_: &Path, _: &str, _: usize) -> Result<Vec<Hit>> {
         bail!("Everything 文件搜索仅支持 Windows")
     }
 
@@ -558,27 +546,23 @@ mod tests {
     }
 
     #[test]
-    fn filters_paths_to_configured_roots() {
-        let roots = vec![PathBuf::from("C:\\Users\\me\\Documents")];
-        assert!(in_roots(
-            Path::new("C:\\Users\\me\\Documents\\note.txt"),
-            &roots,
-            Path::new("C:\\Users\\me\\AppData\\Moin")
-        ));
-        assert!(in_roots(
-            Path::new("\\\\?\\C:\\Users\\me\\Documents\\note.txt"),
-            &roots,
-            Path::new("C:\\Users\\me\\AppData\\Moin")
-        ));
-        assert!(!in_roots(
-            Path::new("C:\\Users\\me\\Documents2\\note.txt"),
-            &roots,
-            Path::new("C:\\Users\\me\\AppData\\Moin")
-        ));
-        assert!(!in_roots(
+    fn excludes_moin_data_directory() {
+        let data_dir = Path::new("C:\\Users\\me\\AppData\\Moin");
+        assert!(internal_path(
             Path::new("C:\\Users\\me\\AppData\\Moin\\index.sqlite3"),
-            &roots,
-            Path::new("C:\\Users\\me\\AppData\\Moin")
+            data_dir
+        ));
+        assert!(internal_path(
+            Path::new("\\\\?\\C:\\Users\\me\\AppData\\Moin\\bin\\Everything64.dll"),
+            data_dir
+        ));
+        assert!(!internal_path(
+            Path::new("C:\\Users\\me\\Documents\\note.txt"),
+            data_dir
+        ));
+        assert!(!internal_path(
+            Path::new("C:\\Users\\me\\AppData\\MoinExtra\\note.txt"),
+            data_dir
         ));
     }
 
@@ -598,7 +582,6 @@ mod tests {
             "Everything.exe",
             SearchMode::Files,
             10,
-            &[PathBuf::from("C:\\Program Files\\Everything")],
         )
         .unwrap();
         assert!(
@@ -618,13 +601,7 @@ mod tests {
             matches!(status, Status::Ready { .. } | Status::Starting { .. }),
             "unexpected Everything status: {status:?}"
         );
-        let hits = search(
-            data_dir.path(),
-            "Everything.exe",
-            10,
-            &[PathBuf::from("C:\\")],
-        )
-        .unwrap();
+        let hits = search(data_dir.path(), "Everything.exe", 10).unwrap();
         assert!(
             hits.iter()
                 .any(|hit| hit.title.eq_ignore_ascii_case("Everything.exe")),

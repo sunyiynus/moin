@@ -18,14 +18,14 @@ impl AiPane {
                     .px(px(10.))
                     .py(px(12.))
                     .gap(px(10.))
-                    .child(
-                        row().px(px(6.)).justify_between().child(
-                            div()
-                                .text_size(rem(12.))
-                                .text_color(rgb(CHAT_MUTED))
-                                .child("会话"),
-                        ),
-                    )
+                    // .child(
+                    //     row().px(px(6.)).justify_between().child(
+                    //         div()
+                    //             .text_size(rem(12.))
+                    //             .text_color(rgb(CHAT_MUTED))
+                    //             .child("会话"),
+                    //     ),
+                    // )
                     .child(
                         div()
                             .id("ai-session-list")
@@ -167,7 +167,7 @@ impl AiPane {
 
     pub(super) fn ai_body(&self, _window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let appearance = &self.appearance;
-        let family = crate::appearance::resolve_ai_family(appearance);
+        let family = crate::app::appearance::resolve_ai_family(appearance);
         let ai_size = appearance.ai_font_size;
         let ai_line = ai_size * 1.65;
         let style = markdown::MarkdownStyle {
@@ -334,7 +334,7 @@ impl AiPane {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .font_family(crate::appearance::mono_font_family())
+                                .font_family(crate::app::appearance::mono_font_family())
                                 .text_size(rem(12.))
                                 .text_color(rgb(CHAT_MUTED))
                                 .child(request.script.lines().next().unwrap_or("").to_owned()),
@@ -377,7 +377,7 @@ impl AiPane {
                                     .max_h(px(180.))
                                     .overflow_y_scroll()
                                     .overflow_x_scroll()
-                                    .font_family(crate::appearance::mono_font_family())
+                                    .font_family(crate::app::appearance::mono_font_family())
                                     .text_size(rem(12.))
                                     .line_height(rem(20.))
                                     .whitespace_nowrap()
@@ -565,7 +565,7 @@ impl AiPane {
 
     pub(super) fn ai_composer(&self, cx: &mut Context<Self>) -> Div {
         let enabled = !self.input.read(cx).value().trim().is_empty();
-        let family = crate::appearance::resolve_ai_family(&self.appearance);
+        let family = crate::app::appearance::resolve_ai_family(&self.appearance);
         let focus = self.input.read(cx).focus_handle(cx);
         div()
             .flex_shrink_0()

@@ -395,7 +395,7 @@ fn agent_executes_lancedb_retrieval_tool_and_returns_sources() {
     )
     .unwrap();
     let database = folder.path().join("index.sqlite3");
-    crate::index::rebuild(&database, &[docs]).unwrap();
+    crate::search::index::rebuild(&database, &[docs]).unwrap();
     let call = sse(
         vec![
             json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_local","type":"function","function":{"name":"search_local_documents","arguments":"{\"query\":\"finch\"}"}}]}),

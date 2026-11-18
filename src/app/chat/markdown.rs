@@ -222,7 +222,7 @@ fn inline_runs(spans: &[Span], style: &MarkdownStyle) -> TextContent {
             len: span.text.len(),
             font: Font {
                 family: if span.style.code {
-                    crate::appearance::mono_font_family().into()
+                    crate::app::appearance::mono_font_family().into()
                 } else {
                     style.font_family.clone()
                 },
@@ -453,7 +453,7 @@ impl Renderer<'_> {
                     .overflow_x_scroll()
                     .px(px(12.))
                     .pb(px(10.))
-                    .font_family(crate::appearance::mono_font_family())
+                    .font_family(crate::app::appearance::mono_font_family())
                     .text_size(px(style.font_size * 0.88))
                     .line_height(px(style.line_height * 0.92))
                     .text_color(rgb(style.text_color))
@@ -752,7 +752,7 @@ mod layout_tests {
     impl Render for Fixture {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let style = MarkdownStyle {
-                font_family: crate::appearance::font_family().into(),
+                font_family: crate::app::appearance::font_family().into(),
                 font_size: 18.,
                 line_height: 28.,
                 text_color: 0xffffff,

@@ -1,18 +1,23 @@
-use crate::{
+use self::{
     appearance::rem,
-    everything,
     input::{Changed, SearchInput},
-    launcher_window,
-    plugins::{PluginResult, Plugins},
-    settings,
 };
-mod ai_chat;
-pub(crate) mod markdown;
+use crate::plugins::{PluginResult, Plugins};
+use moin::search::everything;
+
+pub(crate) mod appearance;
+mod chat;
+#[cfg(windows)]
+pub(crate) mod icons;
+pub(crate) mod input;
+pub(crate) mod launcher_window;
+pub(crate) mod platform;
+pub(crate) mod settings;
 use anyhow::Result;
 use gpui::{prelude::*, *};
 use moin::{
     config::{AppearanceConfig, Config, RecentApp},
-    index::{self, Hit, HitKind, IndexSummary, SearchMode},
+    search::index::{self, Hit, HitKind, IndexSummary, SearchMode},
 };
 use std::{
     path::{Path, PathBuf},
@@ -64,7 +69,7 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
-    ai_chat::bind_keys(cx);
+    chat::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("down", Next, Some("Moin")),
         KeyBinding::new("up", Previous, Some("Moin")),
@@ -106,7 +111,7 @@ pub struct Moin {
     ai_config: moin::ai::AiConfig,
     ai_error: Option<String>,
     ai_notice: Option<String>,
-    ai: ai_chat::AiChat,
+    ai: chat::AiChat,
     input: Entity<SearchInput>,
     mode: SearchMode,
     hits: Vec<Hit>,
@@ -132,7 +137,7 @@ pub struct Moin {
     hotkey_busy: bool,
     hotkey_error: Option<String>,
     #[cfg(any(windows, target_os = "macos"))]
-    tray_controller: crate::tray::TrayController,
+    tray_controller: platform::tray::TrayController,
     scroll: ScrollHandle,
     search_task: Option<Task<()>>,
     _subscription: Subscription,
@@ -143,7 +148,7 @@ impl Moin {
         home: PathBuf,
         config: Config,
         plugins: Plugins,
-        #[cfg(any(windows, target_os = "macos"))] tray_controller: crate::tray::TrayController,
+        #[cfg(any(windows, target_os = "macos"))] tray_controller: platform::tray::TrayController,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -170,7 +175,7 @@ impl Moin {
                 Some(format!("无法读取 AI 设置 · {error:#}")),
             ),
         };
-        let ai = ai_chat::AiChat::new(
+        let ai = chat::AiChat::new(
             cx,
             &config.appearance,
             ai_config.clone(),
@@ -296,7 +301,6 @@ impl Moin {
         self.searching = true;
         let db = self.db.clone();
         let data_dir = self.home.clone();
-        let roots = self.config.roots.clone();
         let everything_enabled = cfg!(windows) && self.config.everything.enabled;
         let mode = self.mode;
         let home = query.is_empty() && mode == SearchMode::All;
@@ -334,7 +338,7 @@ impl Moin {
                     }
                     let limit = if home { HOME_APPS } else { 60 };
                     if everything_enabled {
-                        everything::search_with_index(&db, &data_dir, &query, mode, limit, &roots)
+                        everything::search_with_index(&db, &data_dir, &query, mode, limit)
                     } else {
                         index::search(&db, &query, mode, limit)
                     }
@@ -1360,7 +1364,7 @@ impl Render for Moin {
             .border_color(rgba(0xffffff2e))
             .bg(rgba(0x202020a8))
             .text_color(rgb(INK))
-            .font_family(crate::appearance::resolve_family(
+            .font_family(appearance::resolve_family(
                 &self.config.appearance.ui_font_family,
             ))
             .text_size(rem(16.))
@@ -1390,7 +1394,7 @@ fn row() -> Div {
 }
 
 fn glyph(icon: &'static str, size: f32, color: u32) -> Div {
-    crate::appearance::icon(icon, size, color)
+    appearance::icon(icon, size, color)
 }
 
 fn mark() -> Div {
@@ -1444,8 +1448,8 @@ fn hit_icon(hit: &Hit, window: &mut Window, cx: &mut App) -> Option<AnyElement> 
     #[cfg(windows)]
     {
         let image = match hit.kind {
-            HitKind::App => crate::icons::app_icon(&hit.path, window, cx),
-            _ => crate::icons::file_icon(&hit.path, window, cx),
+            HitKind::App => icons::app_icon(&hit.path, window, cx),
+            _ => icons::file_icon(&hit.path, window, cx),
         }?;
         Some(img(image).size(px(20.)).flex_shrink_0().into_any_element())
     }
@@ -1568,7 +1572,7 @@ fn keycap(key: &'static str) -> Div {
         .bg(rgba(0xffffff0e))
         .text_size(rem(12.))
         .text_color(rgb(MUTED))
-        .child(crate::appearance::shortcut_label(key))
+        .child(appearance::shortcut_label(key))
 }
 
 #[cfg(windows)]
@@ -1612,10 +1616,10 @@ fn open_path(path: &Path) -> Result<()> {
 #[cfg(any(windows, target_os = "macos"))]
 pub fn listen_to_tray(
     handle: WindowHandle<Moin>,
-    receiver: async_channel::Receiver<crate::tray::TrayEvent>,
+    receiver: async_channel::Receiver<platform::tray::TrayEvent>,
     cx: &mut App,
 ) {
-    use crate::tray::TrayEvent;
+    use platform::tray::TrayEvent;
 
     cx.spawn(async move |cx| {
         while let Ok(event) = receiver.recv().await {

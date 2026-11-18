@@ -1,19 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-mod appearance;
-mod everything;
-#[cfg(windows)]
-mod icons;
-mod input;
-mod launcher_window;
+mod app;
 mod plugins;
-mod settings;
-#[cfg(windows)]
-mod tray;
-#[cfg(target_os = "macos")]
-#[path = "tray_macos.rs"]
-mod tray;
-mod ui;
 
 use anyhow::Result;
 use gpui::{
@@ -48,22 +36,22 @@ fn run() -> Result<()> {
     let home = config::data_dir()?;
     let config = config::Config::load(&home)?;
     #[cfg(windows)]
-    let (_tray, events) = match tray::start(&config.activation_hotkey)? {
-        tray::TrayStart::Ready(tray, events) => (tray, events),
-        tray::TrayStart::AlreadyRunning => return Ok(()),
+    let (_tray, events) = match app::platform::tray::start(&config.activation_hotkey)? {
+        app::platform::tray::TrayStart::Ready(tray, events) => (tray, events),
+        app::platform::tray::TrayStart::AlreadyRunning => return Ok(()),
     };
 
     #[cfg(windows)]
     let tray_controller = _tray.controller();
     let plugins = plugins::Plugins::load(&home)?;
-    let application = Application::new().with_assets(appearance::Assets);
+    let application = Application::new().with_assets(app::appearance::Assets);
     #[cfg(target_os = "macos")]
     let reopened = {
-        let window = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::WindowHandle<ui::Moin>>));
+        let window = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::WindowHandle<app::Moin>>));
         let handle = window.clone();
         application.on_reopen(move |cx| {
             if let Some(handle) = handle.get() {
-                let _ = handle.update(cx, |_, window, _| launcher_window::show(window));
+                let _ = handle.update(cx, |_, window, _| app::launcher_window::show(window));
             }
         });
         window
@@ -72,9 +60,9 @@ fn run() -> Result<()> {
         // AppKit's menu bar and global shortcut APIs must be created on the main
         // thread after applicationDidFinishLaunching, which invokes this callback.
         #[cfg(target_os = "macos")]
-        let (_tray, events) = match tray::start(&config.activation_hotkey, &home) {
-            Ok(tray::TrayStart::Ready(tray, events)) => (tray, events),
-            Ok(tray::TrayStart::AlreadyRunning) => {
+        let (_tray, events) = match app::platform::tray::start(&config.activation_hotkey, &home) {
+            Ok(app::platform::tray::TrayStart::Ready(tray, events)) => (tray, events),
+            Ok(app::platform::tray::TrayStart::AlreadyRunning) => {
                 cx.quit();
                 return;
             }
@@ -86,8 +74,8 @@ fn run() -> Result<()> {
         };
         #[cfg(target_os = "macos")]
         let tray_controller = _tray.controller();
-        input::bind_keys(cx);
-        ui::bind_keys(cx);
+        app::input::bind_keys(cx);
+        app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(960.), px(560.)), cx);
         let window = cx.open_window(
             WindowOptions {
@@ -103,14 +91,14 @@ fn run() -> Result<()> {
             move |window, cx| {
                 #[cfg(any(windows, target_os = "macos"))]
                 {
-                    launcher_window::configure(window);
+                    app::launcher_window::configure(window);
                     window.on_window_should_close(cx, |window, _| {
-                        launcher_window::hide(window);
+                        app::launcher_window::hide(window);
                         false
                     });
                 }
                 cx.new(|cx| {
-                    ui::Moin::new(
+                    app::Moin::new(
                         home,
                         config,
                         plugins,
@@ -128,7 +116,7 @@ fn run() -> Result<()> {
                 reopened.set(Some(window));
                 cx.activate(true);
                 #[cfg(any(windows, target_os = "macos"))]
-                ui::listen_to_tray(window, events, cx);
+                app::listen_to_tray(window, events, cx);
             }
             Err(error) => {
                 report_error(&error);

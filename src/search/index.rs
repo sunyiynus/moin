@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{
+use super::{
     embedding::{EmbeddingProfile, Embeddings},
     vector_store::{self, VectorBuilder},
 };

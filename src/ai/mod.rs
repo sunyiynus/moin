@@ -402,7 +402,8 @@ fn search_tool(database: PathBuf, events: Sender<ChatEvent>) -> Result<DynamicTo
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
-                if query.is_empty() || query.chars().count() > crate::index::MAX_QUERY_CHARS {
+                if query.is_empty() || query.chars().count() > crate::search::index::MAX_QUERY_CHARS
+                {
                     return Err(ToolExecutionError::invalid_args(
                         "查询长度须为 1 至 256 个字符",
                     ));
@@ -411,7 +412,7 @@ fn search_tool(database: PathBuf, events: Sender<ChatEvent>) -> Result<DynamicTo
                     .send(ChatEvent::Status("正在检索本地文档…".into()))
                     .await;
                 let hits = tokio::task::spawn_blocking(move || {
-                    crate::index::retrieve(&database, &query, 5)
+                    crate::search::index::retrieve(&database, &query, 5)
                 })
                 .await
                 .map_err(|_| ToolExecutionError::invalid_args("本地检索线程失败"))?
