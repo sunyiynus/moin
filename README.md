@@ -81,7 +81,11 @@ AI 界面左侧支持多个会话，可新建、切换和删除；各会话有�
 
 Windows 上的文件名搜索会优先使用本机 Everything 的索引。Moin 已把 Everything SDK 的 x64 DLL 嵌入 `moin.exe`，首次使用时释放到 Moin 数据目录的 `bin` 文件夹（默认 `%LOCALAPPDATA%\Moin\bin`）并动态加载；本机需要安装并运行 [Everything](https://www.voidtools.com/)。Everything 未安装、未运行或 IPC 不可用时，Moin 会自动回退到自己的 SQLite 文件名索引，搜索不会中断。
 
-在「设置 → 搜索」可以查看 Everything 连接状态、重新检测或启动 Everything。文件名搜索直接使用 Everything 的索引，不需要设置搜索目录；「设置 → 索引」中配置的目录只用于建立正文和向量索引。Everything 只提供文件名和路径结果，正文和向量检索仍由 Moin 完成。SDK 来源和许可见 `assets/everything/NOTICE.md`。
+在「设置 → 搜索」可以查看 Everything 连接状态、重新检测或启动 Everything。文件名搜索直接使用 Everything 的索引，不需要设置搜索目录；连接后查询内容会原样交给 Everything，可使用 `ext:`、`path:`、`|` 等 Everything 搜索语法，并按 Everything 的结果顺序显示。
+
+结果同时包含文件和文件夹，文件夹显示为「文件夹」并可用 `Enter` 直接在资源管理器打开。查询中的 `\`、`/` 或盘符前缀（如 `C:`）会被识别为路径搜索，Moin 会对这类查询启用路径匹配，因此可以直接输入 `C:\Users\me\Documents` 这类完整路径；也可以用 `path:` 显式限定路径，用 `folder:` 只匹配文件夹。
+
+「设置 → 索引」中配置的目录只用于建立正文和向量索引。Everything 只提供文件名和路径结果，正文和向量检索仍由 Moin 完成。SDK 来源和许可见 `assets/everything/NOTICE.md`。
 
 ## 本地正文检索
 

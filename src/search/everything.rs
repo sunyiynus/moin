@@ -4,6 +4,11 @@
 //! directory on first use. Everything itself is a separate application: Moin
 //! only talks to it over local IPC and falls back to its own index when it is
 //! not running.
+//!
+//! Queries are passed through unchanged, and results include both files and
+//! folders. Queries that look like paths (contain `\`, `/`, or start with a
+//! drive letter) enable Everything's path matching so full paths can be
+//! entered directly.
 
 use super::index::{self, Hit, HitKind, SearchMode};
 use anyhow::{Result, bail};
@@ -51,38 +56,41 @@ pub fn search_with_index(
         return index::search(database, query, mode, limit);
     }
 
-    let overfetch = limit.saturating_mul(2).max(limit);
-    let mut names = index::search_names(database, query, mode, overfetch)?;
-    match search(data_dir, query, limit) {
-        Ok(external) => names = merge_names(names, external, query, limit),
-        Err(_) => names.truncate(limit),
+    // Keep Moin's application results, but use Everything's own result order and
+    // search syntax for filenames.
+    let mut hits = if mode == SearchMode::All {
+        index::search_names(database, query, SearchMode::Apps, limit.min(5))?
+    } else {
+        Vec::new()
+    };
+    let remaining = limit.saturating_sub(hits.len());
+    match search(data_dir, query, remaining) {
+        Ok(files) => {
+            let mut seen = hits
+                .iter()
+                .map(|hit| path_key(&hit.path))
+                .collect::<HashSet<_>>();
+            for hit in files {
+                if hits.len() >= limit {
+                    break;
+                }
+                if seen.insert(path_key(&hit.path)) {
+                    hits.push(hit);
+                }
+            }
+        }
+        Err(_) => return index::search(database, query, mode, limit),
     }
 
-    if mode == SearchMode::All && names.len() < limit {
-        let remaining = limit - names.len();
+    if mode == SearchMode::All && hits.len() < limit {
+        let remaining = limit - hits.len();
         match index::retrieve(database, query, remaining) {
-            Ok(text) => append_text(&mut names, text, limit),
-            Err(error) if names.is_empty() => return Err(error),
+            Ok(text) => append_text(&mut hits, text, limit),
+            Err(error) if hits.is_empty() => return Err(error),
             Err(_) => {}
         }
     }
-    Ok(names)
-}
-
-/// Merge local and Everything filename results, preferring local metadata for
-/// duplicate paths and ranking exact/prefix matches first.
-pub fn merge_names(internal: Vec<Hit>, external: Vec<Hit>, query: &str, limit: usize) -> Vec<Hit> {
-    let query = query.trim().to_lowercase();
-    let mut seen = HashSet::new();
-    let mut merged = Vec::with_capacity(internal.len() + external.len());
-    for hit in internal.into_iter().chain(external) {
-        if seen.insert(path_key(&hit.path)) {
-            merged.push(hit);
-        }
-    }
-    merged.sort_by_key(|hit| rank(hit, &query));
-    merged.truncate(limit);
-    merged
+    Ok(hits)
 }
 
 fn append_text(names: &mut Vec<Hit>, text: Vec<Hit>, limit: usize) {
@@ -98,25 +106,6 @@ fn append_text(names: &mut Vec<Hit>, text: Vec<Hit>, limit: usize) {
             names.push(hit);
         }
     }
-}
-
-fn rank(hit: &Hit, query: &str) -> (u8, u8, usize, String) {
-    let title = hit.title.to_lowercase();
-    let score = if query.is_empty() || title == query {
-        0
-    } else if title.starts_with(query) {
-        1
-    } else if title.contains(query) {
-        2
-    } else {
-        3
-    };
-    let kind = match hit.kind {
-        HitKind::App => 0,
-        HitKind::File => 1,
-        HitKind::Text => 2,
-    };
-    (kind, score, title.chars().count(), title)
 }
 
 fn path_key(path: &Path) -> String {
@@ -135,8 +124,14 @@ fn internal_path(path: &Path, data_dir: &Path) -> bool {
     !data_dir.is_empty() && (key == data_dir || key.starts_with(&format!("{data_dir}\\")))
 }
 
-fn escaped_query(query: &str) -> String {
-    format!("\"{}\"", query.trim().replace('"', " "))
+fn looks_like_path(query: &str) -> bool {
+    let query = query.trim();
+    query.contains(['\\', '/'])
+        || (query.as_bytes().get(1) == Some(&b':')
+            && query
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic()))
 }
 
 pub fn status(data_dir: &Path) -> Status {
@@ -185,6 +180,7 @@ mod platform {
     type QueryW = unsafe extern "system" fn(i32) -> i32;
     type GetNumResults = unsafe extern "system" fn() -> u32;
     type IsFileResult = unsafe extern "system" fn(u32) -> i32;
+    type IsFolderResult = unsafe extern "system" fn(u32) -> i32;
     type IsDbLoaded = unsafe extern "system" fn() -> i32;
     type GetResultFullPathNameW = unsafe extern "system" fn(u32, *mut u16, u32) -> u32;
     type GetLastError = unsafe extern "system" fn() -> u32;
@@ -206,6 +202,7 @@ mod platform {
         query: QueryW,
         get_num_results: GetNumResults,
         is_file_result: IsFileResult,
+        is_folder_result: IsFolderResult,
         is_db_loaded: IsDbLoaded,
         get_result_full_path: GetResultFullPathNameW,
         get_last_error: GetLastError,
@@ -261,16 +258,15 @@ mod platform {
         let _guard = QUERY_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let search = escaped_query(query);
-        let wide: Vec<u16> = search.encode_utf16().chain(std::iter::once(0)).collect();
-        let max = limit.saturating_mul(4).clamp(limit, 1000) as u32;
+        let wide: Vec<u16> = query
+            .trim()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let max = limit as u32;
         unsafe {
             (api.set_search)(wide.as_ptr());
-            (api.set_match_path)(if query.contains(['/', '\\', ':']) {
-                1
-            } else {
-                0
-            });
+            (api.set_match_path)(i32::from(looks_like_path(query)));
             (api.set_match_case)(0);
             (api.set_regex)(0);
             (api.set_request_flags)(REQUEST_FILE_NAME | REQUEST_PATH);
@@ -284,7 +280,7 @@ mod platform {
             let count = (api.get_num_results)();
             let mut hits = Vec::new();
             for index in 0..count {
-                if (api.is_file_result)(index) == 0 {
+                if (api.is_file_result)(index) == 0 && (api.is_folder_result)(index) == 0 {
                     continue;
                 }
                 let Some(path) = result_path(api, index) else {
@@ -306,7 +302,11 @@ mod platform {
                     path,
                     detail,
                     excerpt: String::new(),
-                    kind: HitKind::File,
+                    kind: if (api.is_folder_result)(index) != 0 {
+                        HitKind::Folder
+                    } else {
+                        HitKind::File
+                    },
                     chunk: None,
                 });
             }
@@ -361,6 +361,7 @@ mod platform {
                 query: unsafe { symbol(module, b"Everything_QueryW\0") }?,
                 get_num_results: unsafe { symbol(module, b"Everything_GetNumResults\0") }?,
                 is_file_result: unsafe { symbol(module, b"Everything_IsFileResult\0") }?,
+                is_folder_result: unsafe { symbol(module, b"Everything_IsFolderResult\0") }?,
                 is_db_loaded: unsafe { symbol(module, b"Everything_IsDBLoaded\0") }?,
                 get_result_full_path: unsafe {
                     symbol(module, b"Everything_GetResultFullPathNameW\0")
@@ -505,44 +506,15 @@ mod platform {
 mod tests {
     use super::*;
 
-    fn hit(title: &str, path: &str, kind: HitKind) -> Hit {
-        Hit {
-            title: title.into(),
-            path: PathBuf::from(path),
-            detail: String::new(),
-            excerpt: String::new(),
-            kind,
-            chunk: None,
-        }
-    }
-
     #[test]
-    fn merges_and_deduplicates_by_path() {
-        let local = vec![
-            hit("Moin", "C:\\Tools\\Moin.exe", HitKind::File),
-            hit("Other", "C:\\Other\\file.txt", HitKind::File),
-        ];
-        let external = vec![
-            hit("Moin", "c:/tools/MOIN.exe", HitKind::File),
-            hit("Moin", "C:\\Tools\\Moin.exe", HitKind::File),
-            hit("Moin", "C:\\Tools\\Moin.exe", HitKind::File),
-        ];
-        let merged = merge_names(local, external, "moin", 10);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].path, PathBuf::from("C:\\Tools\\Moin.exe"));
-    }
-
-    #[test]
-    fn ranks_exact_and_prefix_matches_first() {
-        let hits = vec![
-            hit("moin-extra", "C:\\a\\moin-extra.txt", HitKind::File),
-            hit("moin", "C:\\a\\moin.txt", HitKind::File),
-            hit("xmoin", "C:\\a\\xmoin.txt", HitKind::File),
-        ];
-        let merged = merge_names(Vec::new(), hits, "Moin", 3);
-        assert_eq!(merged[0].title, "moin");
-        assert_eq!(merged[1].title, "moin-extra");
-        assert_eq!(merged[2].title, "xmoin");
+    fn recognizes_path_queries_without_mistaking_search_filters() {
+        assert!(looks_like_path("C:\\Users\\me"));
+        assert!(looks_like_path("C:/Users/me"));
+        assert!(looks_like_path("C:"));
+        assert!(looks_like_path("Documents/report"));
+        assert!(!looks_like_path("ext:md"));
+        assert!(!looks_like_path("path:Documents report"));
+        assert!(!looks_like_path("report"));
     }
 
     #[test]
@@ -566,20 +538,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn quotes_literal_queries() {
-        assert_eq!(escaped_query("  hello \"world\" "), "\"hello  world \"");
-    }
-
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     #[ignore = "requires Everything to be installed and running"]
-    fn combines_local_index_with_everything_results() {
+    fn uses_everything_results_directly() {
         let data_dir = tempfile::tempdir().unwrap();
         let hits = search_with_index(
             &data_dir.path().join("index.sqlite3"),
             data_dir.path(),
-            "Everything.exe",
+            "ext:exe Everything",
             SearchMode::Files,
             10,
         )
@@ -588,6 +555,20 @@ mod tests {
             hits.iter()
                 .any(|hit| hit.title.eq_ignore_ascii_case("Everything.exe")),
             "no combined Everything.exe result: {hits:?}"
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires Everything to be installed and running"]
+    fn returns_folders_for_path_queries() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let hits = search(data_dir.path(), "C:\\Program Files\\Everything", 50).unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.kind == HitKind::Folder
+                    && hit.title.eq_ignore_ascii_case("Everything")),
+            "no folder result: {hits:?}"
         );
     }
 

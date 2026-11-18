@@ -1023,7 +1023,7 @@ impl Moin {
                 let (glyph, label, color) = hit_style(hit.kind);
                 let detail = if hit.kind == HitKind::Text {
                     collapse(&hit.excerpt)
-                } else if hit.kind == HitKind::File {
+                } else if matches!(hit.kind, HitKind::File | HitKind::Folder) {
                     hit.path
                         .parent()
                         .map(|parent| parent.display().to_string())
@@ -1435,6 +1435,7 @@ fn hit_style(kind: HitKind) -> (&'static str, &'static str, u32) {
     match kind {
         HitKind::App => ("\u{e71d}", "应用", 0x9ecafa),
         HitKind::File => ("\u{e8b7}", "文件", 0xf5cc90),
+        HitKind::Folder => ("\u{e8b7}", "文件夹", 0xf5cc90),
         HitKind::Text => ("\u{e8a5}", "正文", 0xb5d8fa),
     }
 }
@@ -1444,7 +1445,8 @@ fn hit_icon(hit: &Hit, window: &mut Window, cx: &mut App) -> Option<AnyElement> 
     {
         let image = match hit.kind {
             HitKind::App => icons::app_icon(&hit.path, window, cx),
-            _ => icons::file_icon(&hit.path, window, cx),
+            HitKind::File | HitKind::Text => icons::file_icon(&hit.path, window, cx),
+            HitKind::Folder => None,
         }?;
         Some(img(image).size(px(20.)).flex_shrink_0().into_any_element())
     }

@@ -98,7 +98,7 @@ impl Page {
         match self {
             Self::Search => {
                 if cfg!(windows) {
-                    "文件名搜索使用 Everything，不需要设置搜索范围。"
+                    "文件名搜索使用 Everything，可检索文件和文件夹，不需要设置搜索范围。"
                 } else {
                     "当前平台使用 Moin 本地索引检索文件名。"
                 }
@@ -594,7 +594,7 @@ impl Settings {
                 setting_row(
                     "\u{e8b7}",
                     "Everything 文件名搜索",
-                    "直接使用 Everything 的文件名索引，无需设置搜索目录；未连接时自动回退本地索引。",
+                    "直接使用 Everything 索引检索文件和文件夹，无需设置搜索目录；输入完整路径会自动按路径匹配。未连接时回退本地索引。",
                 )
                 .id("everything-toggle")
                 .tab_index(0)

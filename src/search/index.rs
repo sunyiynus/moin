@@ -64,6 +64,7 @@ pub enum SearchMode {
 pub enum HitKind {
     App,
     File,
+    Folder,
     Text,
 }
 
