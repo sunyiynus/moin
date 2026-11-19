@@ -1393,6 +1393,12 @@ impl Settings {
         let (status, status_color) = mihomo_status_label(&snapshot.mihomo_state);
         let log_dir = snapshot.data_dir.join("mihomo").join("logs");
         let log_hint = log_dir.to_string_lossy().into_owned();
+        let work_dir = snapshot
+            .mihomo
+            .config_path
+            .parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "选择配置文件后确定".into());
         let error = snapshot
             .mihomo_error
             .clone()
@@ -1588,7 +1594,10 @@ impl Settings {
                     )
                     .child(description(
                         "Moin 使用 mihomo -d <配置目录> -f <配置文件> 启动核心；PID 与日志保存在数据目录的 mihomo 文件夹。",
-                    )),
+                    ))
+                    .child(description(format!(
+                        "工作目录：{work_dir}。GEOIP/GEOSITE 规则需要此目录下的 geoip.dat / geosite.dat（配合 geodata-mode: true），或 geoip.metadb。",
+                    ))),
             )
             .child(
                 section("控制器")

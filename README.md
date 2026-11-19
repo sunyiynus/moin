@@ -123,6 +123,8 @@ Moin 可以托管本机 [mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Met
 
 核心由 [`mihomo-driver`](https://crates.io/crates/mihomo-driver) 启动，命令行为 `mihomo -d <配置目录> -f <配置文件>`，PID 记录保存在数据目录的 `mihomo/mihomo.pid`，输出写入 `mihomo/logs/mihomo.log`。打开「随 Moin 启动」后，下次启动 Moin 会按已保存的设置自动拉起核心；退出 Moin 时会尝试停止核心。
 
+`-d` 工作目录就是配置文件所在目录。配置使用 `GEOIP` / `GEOSITE` 规则时，请把 `geoip.dat` / `geosite.dat` 放到该目录并设置 `geodata-mode: true`，或在该目录放置 `geoip.metadb`；否则 mihomo 首次启动会尝试从 GitHub 下载 `geoip.metadb`，网络不可达时核心会直接退出。控制器需要在配置中写成 `external-controller: 127.0.0.1:<端口>`，并与设置页的控制器地址一致。
+
 控制器只接受 `http://` + `127.0.0.0/8` 或 `::1` 字面量和显式端口，例如 `http://127.0.0.1:9090`。设置统一保存在 `settings.json` 的 `mihomo` 字段：
 
 ```json
