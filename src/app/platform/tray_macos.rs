@@ -9,10 +9,10 @@ use cocoa::{
 };
 use fs2::FileExt;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
-use moin::hotkey::Shortcut;
+use moin::hotkey::{FeatureAction, FeatureShortcuts, Shortcut};
 use std::{
     cell::RefCell,
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
     io,
@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
@@ -39,6 +39,7 @@ pub enum TrayEvent {
     Show,
     Quit,
     HotkeyChanged(Option<String>),
+    ActivateFeature(FeatureAction),
 }
 
 pub enum TrayStart {
@@ -72,6 +73,17 @@ impl TrayController {
         self.change(None)
     }
 
+    pub fn change_feature_hotkeys(
+        &self,
+        shortcuts: &FeatureShortcuts,
+    ) -> Result<Receiver<Result<()>>> {
+        let shortcuts = shortcuts.parsed()?;
+        let (response, receiver) = async_channel::bounded(1);
+        let result = self.host.borrow_mut().replace_feature_shortcuts(&shortcuts);
+        let _ = response.try_send(result);
+        Ok(receiver)
+    }
+
     fn change(&self, shortcut: Option<Shortcut>) -> Result<Receiver<Result<String>>> {
         // Controllers live in UI entities and cannot leave the AppKit thread.
         // Keep the Windows asynchronous response contract for settings rollback.
@@ -85,6 +97,9 @@ impl TrayController {
 struct Host {
     manager: GlobalHotKeyManager,
     registered: Option<(Shortcut, HotKey)>,
+    features: Vec<RegisteredFeature>,
+    feature_ids: Arc<Mutex<HashMap<u32, FeatureAction>>>,
+    feature_pressed: Arc<Mutex<HashSet<u32>>>,
     registered_id: Arc<AtomicU32>,
     pressed_id: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
@@ -97,6 +112,16 @@ impl Host {
     fn replace_shortcut(&mut self, shortcut: Option<Shortcut>) -> Result<String> {
         if self.registered.map(|(key, _)| key) == shortcut {
             return Ok(shortcut.map(|key| key.label()).unwrap_or_default());
+        }
+        if let Some(shortcut) = shortcut {
+            anyhow::ensure!(
+                !self
+                    .features
+                    .iter()
+                    .any(|feature| feature.shortcut == shortcut),
+                "{} 已分配给功能快捷键，请先修改该功能",
+                shortcut.label()
+            );
         }
         let next = shortcut
             .map(|shortcut| {
@@ -133,12 +158,143 @@ impl Host {
             .try_send(TrayEvent::HotkeyChanged(label.clone()));
         Ok(label.unwrap_or_default())
     }
+
+    fn replace_feature_shortcuts(&mut self, desired: &[(FeatureAction, Shortcut)]) -> Result<()> {
+        let mut keys = HashSet::new();
+        let mut actions = HashSet::new();
+        for &(action, shortcut) in desired {
+            anyhow::ensure!(actions.insert(action), "功能快捷键重复：{}", action.label());
+            anyhow::ensure!(
+                keys.insert(shortcut),
+                "快捷键 {} 已分配给其他功能",
+                shortcut.label()
+            );
+            anyhow::ensure!(
+                self.registered.map(|(key, _)| key) != Some(shortcut),
+                "{} 与主激活快捷键冲突",
+                shortcut.label()
+            );
+        }
+        let mut next = Vec::with_capacity(desired.len());
+        let mut staged = Vec::<HotKey>::new();
+        for &(action, shortcut) in desired {
+            let hotkey = if let Some(existing) = self
+                .features
+                .iter()
+                .find(|feature| feature.shortcut == shortcut)
+            {
+                existing.hotkey
+            } else {
+                let hotkey = match shortcut.label().parse::<HotKey>() {
+                    Ok(hotkey) => hotkey,
+                    Err(error) => {
+                        for key in &staged {
+                            let _ = self.manager.unregister(*key);
+                        }
+                        return Err(error).context("macOS 无法识别这个功能快捷键");
+                    }
+                };
+                if let Err(error) = self.manager.register(hotkey) {
+                    for key in &staged {
+                        let _ = self.manager.unregister(*key);
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "{}：{} 已被占用或无法注册，原快捷键保持生效",
+                            action.label(),
+                            shortcut.label()
+                        )
+                    });
+                }
+                staged.push(hotkey);
+                hotkey
+            };
+            next.push(RegisteredFeature {
+                action,
+                shortcut,
+                hotkey,
+            });
+        }
+        let obsolete = self
+            .features
+            .iter()
+            .filter(|feature| {
+                !next
+                    .iter()
+                    .any(|next| next.hotkey.id() == feature.hotkey.id())
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut removed = Vec::<RegisteredFeature>::new();
+        for obsolete in obsolete {
+            if let Err(error) = self.manager.unregister(obsolete.hotkey) {
+                let mut lost = HashSet::new();
+                let mut restore_errors = Vec::new();
+                for old in &removed {
+                    if let Err(error) = self.manager.register(old.hotkey) {
+                        lost.insert(old.hotkey.id());
+                        restore_errors.push(format!("{}：{error}", old.shortcut.label()));
+                    }
+                }
+                for key in &staged {
+                    let _ = self.manager.unregister(*key);
+                }
+                if !restore_errors.is_empty() {
+                    self.features
+                        .retain(|feature| !lost.contains(&feature.hotkey.id()));
+                    self.publish_feature_ids();
+                    bail!(
+                        "无法释放旧快捷键，且部分快捷键无法恢复：{}；原始错误：{error}",
+                        restore_errors.join("；")
+                    );
+                }
+                return Err(error).context("无法释放旧功能快捷键，已恢复原设置");
+            }
+            removed.push(obsolete);
+        }
+        self.features = next;
+        self.publish_feature_ids();
+        Ok(())
+    }
+
+    fn publish_feature_ids(&self) {
+        *self
+            .feature_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = self
+            .features
+            .iter()
+            .map(|feature| (feature.hotkey.id(), feature.action))
+            .collect();
+        self.feature_pressed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RegisteredFeature {
+    action: FeatureAction,
+    shortcut: Shortcut,
+    hotkey: HotKey,
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         self.registered_id.store(0, Ordering::Release);
+        self.feature_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.feature_pressed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        for feature in self.features.drain(..) {
+            let _ = self.manager.unregister(feature.hotkey);
+        }
         if let Some((_, hotkey)) = self.registered {
             let _ = self.manager.unregister(hotkey);
         }
@@ -168,25 +324,52 @@ pub fn start(shortcut: &str, home: &Path) -> Result<TrayStart> {
     let registered_id = Arc::new(AtomicU32::new(0));
     let pressed_id = Arc::new(AtomicU32::new(0));
     let alive = Arc::new(AtomicBool::new(true));
+    let feature_ids = Arc::new(Mutex::new(HashMap::<u32, FeatureAction>::new()));
+    let feature_pressed = Arc::new(Mutex::new(HashSet::<u32>::new()));
+    let callback_feature_ids = feature_ids.clone();
+    let callback_feature_pressed = feature_pressed.clone();
     let active = registered_id.clone();
     let pressed = pressed_id.clone();
     let hotkey_alive = alive.clone();
     let hotkey_events = events.clone();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-        if !hotkey_alive.load(Ordering::Acquire) || event.id != active.load(Ordering::Acquire) {
+        if !hotkey_alive.load(Ordering::Acquire) {
             return;
         }
-        match event.state {
-            HotKeyState::Pressed => {
-                if pressed
-                    .compare_exchange(0, event.id, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let _ = hotkey_events.try_send(TrayEvent::Toggle);
+        if event.id == active.load(Ordering::Acquire) {
+            match event.state {
+                HotKeyState::Pressed => {
+                    if pressed
+                        .compare_exchange(0, event.id, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let _ = hotkey_events.try_send(TrayEvent::Toggle);
+                    }
+                }
+                HotKeyState::Released => {
+                    pressed.store(0, Ordering::Release);
                 }
             }
-            HotKeyState::Released => {
-                pressed.store(0, Ordering::Release);
+            return;
+        }
+        let action = callback_feature_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&event.id)
+            .copied();
+        if let Some(action) = action {
+            let mut pressed = callback_feature_pressed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match event.state {
+                HotKeyState::Pressed => {
+                    if pressed.insert(event.id) {
+                        let _ = hotkey_events.try_send(TrayEvent::ActivateFeature(action));
+                    }
+                }
+                HotKeyState::Released => {
+                    pressed.remove(&event.id);
+                }
             }
         }
     }));
@@ -245,6 +428,9 @@ pub fn start(shortcut: &str, home: &Path) -> Result<TrayStart> {
     let mut host = Host {
         manager,
         registered: None,
+        features: Vec::new(),
+        feature_ids,
+        feature_pressed,
         registered_id,
         pressed_id,
         alive,

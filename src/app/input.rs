@@ -270,6 +270,10 @@ impl SearchInput {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.text.is_empty() && self.marked.is_none() {
+            cx.propagate();
+            return;
+        }
         if self.selection().is_empty() {
             self.anchor = self.previous_grapheme();
         }

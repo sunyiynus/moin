@@ -12,6 +12,7 @@ pub(crate) mod icons;
 pub(crate) mod input;
 pub(crate) mod launcher_window;
 pub(crate) mod platform;
+mod preview;
 pub(crate) mod settings;
 use anyhow::Result;
 use gpui::{prelude::*, *};
@@ -120,6 +121,12 @@ pub struct Moin {
     indexing: bool,
     settings_window: Option<WindowHandle<settings::Settings>>,
     preview_open: bool,
+    file_preview: Option<preview::FilePreview>,
+    preview_key: Option<(PathBuf, Option<usize>)>,
+    preview_error: Option<String>,
+    preview_loading: bool,
+    preview_generation: u64,
+    preview_task: Option<Task<()>>,
     actions_open: bool,
     selected_action: usize,
     commands: Vec<Command>,
@@ -136,6 +143,8 @@ pub struct Moin {
     active_hotkey: Option<String>,
     hotkey_busy: bool,
     hotkey_error: Option<String>,
+    feature_shortcuts_busy: bool,
+    feature_shortcuts_error: Option<String>,
     #[cfg(any(windows, target_os = "macos"))]
     tray_controller: platform::tray::TrayController,
     scroll: ScrollHandle,
@@ -194,6 +203,12 @@ impl Moin {
             indexing: false,
             settings_window: None,
             preview_open: false,
+            file_preview: None,
+            preview_key: None,
+            preview_error: None,
+            preview_loading: false,
+            preview_generation: 0,
+            preview_task: None,
             actions_open: false,
             selected_action: 0,
             commands,
@@ -210,6 +225,8 @@ impl Moin {
             active_hotkey: None,
             hotkey_busy: false,
             hotkey_error: None,
+            feature_shortcuts_busy: false,
+            feature_shortcuts_error: None,
             #[cfg(any(windows, target_os = "macos"))]
             tray_controller,
             scroll: ScrollHandle::new(),
@@ -218,6 +235,7 @@ impl Moin {
         };
         this.update_index(false, cx);
         this.refresh_everything_status(cx);
+        this.configure_feature_shortcuts(this.config.feature_shortcuts.clone(), false, cx);
         this
     }
 
@@ -277,11 +295,20 @@ impl Moin {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.mode == SearchMode::All {
+            if let Some((mode, query)) = parse_scope_prefix(self.input.read(cx).value()) {
+                self.mode = mode;
+                self.input
+                    .update(cx, |input, cx| input.set_value(query, cx));
+                return;
+            }
+        }
         self.search_task.take();
         self.searching = false;
         self.plugin_busy = false;
         self.result = None;
         self.preview_open = false;
+        self.clear_file_preview();
         self.actions_open = false;
         self.error = None;
         self.notice = None;
@@ -346,6 +373,7 @@ impl Moin {
                     Err(_) if view.indexing => {}
                     Err(error) => view.error = Some(format!("搜索失败 · {error:#}")),
                 }
+                view.update_file_preview(cx);
                 cx.notify();
             });
         }));
@@ -460,6 +488,9 @@ impl Moin {
             activation_hotkey: self.config.activation_hotkey.clone(),
             hotkey_busy: self.hotkey_busy,
             hotkey_error: self.hotkey_error.clone(),
+            feature_shortcuts: self.config.feature_shortcuts.clone(),
+            feature_shortcuts_busy: self.feature_shortcuts_busy,
+            feature_shortcuts_error: self.feature_shortcuts_error.clone(),
             ai_config: self.ai_config.clone(),
             ai_error: self.ai_error.clone(),
             ai_notice: self.ai_notice.clone(),
@@ -540,7 +571,154 @@ impl Moin {
         }
     }
 
+    pub fn save_feature_shortcuts(
+        &mut self,
+        shortcuts: moin::hotkey::FeatureShortcuts,
+        cx: &mut Context<Self>,
+    ) {
+        self.configure_feature_shortcuts(shortcuts, true, cx);
+    }
+
+    fn configure_feature_shortcuts(
+        &mut self,
+        shortcuts: moin::hotkey::FeatureShortcuts,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hotkey_busy || self.feature_shortcuts_busy {
+            return;
+        }
+        let shortcuts = match shortcuts.normalized(&self.config.activation_hotkey) {
+            Ok(shortcuts) => shortcuts,
+            Err(error) => {
+                self.feature_shortcuts_error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let receiver = match self.tray_controller.change_feature_hotkeys(&shortcuts) {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    self.feature_shortcuts_error = Some(format!("{error:#}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            let previous = self.config.feature_shortcuts.clone();
+            self.feature_shortcuts_busy = true;
+            self.feature_shortcuts_error = None;
+            cx.spawn(async move |view, cx| {
+                let result = receiver.recv().await;
+                let rollback = view
+                    .update(cx, |view, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                if persist {
+                                    let mut config = view.config.clone();
+                                    config.feature_shortcuts = shortcuts;
+                                    match config.save(&view.home) {
+                                        Ok(()) => view.config = config,
+                                        Err(error) => {
+                                            view.feature_shortcuts_error =
+                                                Some(format!("功能快捷键未保存 · {error:#}"));
+                                            cx.notify();
+                                            return Some(
+                                                view.tray_controller
+                                                    .change_feature_hotkeys(&previous),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                view.feature_shortcuts_error =
+                                    Some(format!("功能快捷键未启用 · {error:#}"))
+                            }
+                            Err(_) => {
+                                view.feature_shortcuts_error = Some("功能快捷键服务已停止".into())
+                            }
+                        }
+                        view.feature_shortcuts_busy = false;
+                        cx.notify();
+                        None
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(rollback) = rollback {
+                    let error = match rollback {
+                        Ok(receiver) => match receiver.recv().await {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(error) => Some(error.to_string()),
+                        },
+                        Err(error) => Some(error.to_string()),
+                    };
+                    let _ = view.update(cx, |view, cx| {
+                        if let Some(error) = error {
+                            let original = view.feature_shortcuts_error.take().unwrap_or_default();
+                            view.feature_shortcuts_error =
+                                Some(format!("{original}。恢复旧功能快捷键失败 · {error}"));
+                        }
+                        view.feature_shortcuts_busy = false;
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+            cx.notify();
+        }
+    }
+
+    fn activate_feature(
+        &mut self,
+        feature: moin::hotkey::FeatureAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use moin::hotkey::FeatureAction;
+        self.actions_open = false;
+        match feature {
+            FeatureAction::All
+            | FeatureAction::Apps
+            | FeatureAction::Files
+            | FeatureAction::Text => {
+                let mode = match feature {
+                    FeatureAction::Apps => SearchMode::Apps,
+                    FeatureAction::Files => SearchMode::Files,
+                    FeatureAction::Text => SearchMode::Text,
+                    _ => SearchMode::All,
+                };
+                self.input.update(cx, |input, cx| input.clear(cx));
+                self.set_mode(mode, window, cx);
+            }
+            FeatureAction::Ai => self.set_ai(true, window, cx),
+            FeatureAction::Settings => {
+                self.open_settings(window, cx);
+                return;
+            }
+            _ => {
+                self.set_mode(SearchMode::All, window, cx);
+                if let Some(command) = feature.command() {
+                    self.tool(command, window, cx);
+                }
+            }
+        }
+        launcher_window::show(window);
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
     pub fn save_activation_hotkey(&mut self, value: String, cx: &mut Context<Self>) {
+        if self.feature_shortcuts_busy {
+            return;
+        }
+        if let Err(error) = self.config.feature_shortcuts.normalized(&value) {
+            self.hotkey_error = Some(format!("{error:#}"));
+            cx.notify();
+            return;
+        }
         #[cfg(any(windows, target_os = "macos"))]
         {
             if self.hotkey_busy {
@@ -626,6 +804,163 @@ impl Moin {
         self.mode == SearchMode::All && self.input.read(cx).value().trim().is_empty()
     }
 
+    fn clear_file_preview(&mut self) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_task.take();
+        self.preview_key = None;
+        self.file_preview = None;
+        self.preview_error = None;
+        self.preview_loading = false;
+    }
+
+    fn update_file_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(hit) = self
+            .hits
+            .get(self.selected)
+            .filter(|hit| hit.kind != HitKind::App)
+            .cloned()
+        else {
+            self.clear_file_preview();
+            return;
+        };
+        let key = (hit.path.clone(), hit.chunk);
+        if self.preview_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.clear_file_preview();
+        self.preview_key = Some(key);
+        self.preview_loading = true;
+        let generation = self.preview_generation;
+        let executor = cx.background_executor().clone();
+        self.preview_task = Some(cx.spawn(async move |view, cx| {
+            // Fast arrow navigation need not open each file along the way.
+            executor.timer(Duration::from_millis(90)).await;
+            let result = executor.spawn(async move { preview::load(&hit) }).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.preview_generation != generation {
+                    return;
+                }
+                view.preview_loading = false;
+                match result {
+                    Ok(preview) => view.file_preview = Some(preview),
+                    Err(error) => view.preview_error = Some(format!("无法预览 · {error:#}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn result_row(&self, selected: usize, cx: &App) -> usize {
+        selected
+            + 1
+            + usize::from(
+                self.showing_commands(cx) && !self.hits.is_empty() && selected >= self.hits.len(),
+            )
+    }
+
+    fn select_result(&mut self, index: usize, cx: &mut Context<Self>) {
+        let len = self.hits.len()
+            + if self.showing_commands(cx) {
+                self.commands.len()
+            } else {
+                0
+            };
+        if len == 0 {
+            return;
+        }
+        self.selected = index.min(len - 1);
+        self.scroll
+            .scroll_to_item(self.result_row(self.selected, cx));
+        self.notice = None;
+        self.update_file_preview(cx);
+        if self.preview_key.is_none() {
+            self.preview_open = false;
+        }
+        cx.notify();
+    }
+
+    fn select_visible_result(
+        &mut self,
+        offset: usize,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.hits.len()
+            + if self.showing_commands(cx) {
+                self.commands.len()
+            } else {
+                0
+            };
+        let top = self.scroll.top_item();
+        let bottom = self.scroll.bottom_item();
+        if let Some(index) = (0..len)
+            .filter(|index| {
+                let row = self.result_row(*index, cx);
+                row >= top && row <= bottom
+            })
+            .nth(offset)
+        {
+            self.select_result(index, cx);
+            if run {
+                self.confirm(window, cx);
+            }
+        }
+    }
+
+    fn return_to_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai.active || self.composing(cx) {
+            return;
+        }
+        if self.mode != SearchMode::All {
+            self.set_mode(SearchMode::All, window, cx);
+        } else if self.plugins.recognizes(&self.query(cx)) {
+            self.input.update(cx, |input, cx| input.clear(cx));
+        }
+    }
+
+    fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai.active || self.composing(cx) {
+            return;
+        }
+        let stroke = &event.keystroke;
+        if stroke.modifiers.alt && !stroke.modifiers.control && !stroke.modifiers.platform {
+            if self.actions_open {
+                return;
+            }
+            if let Some(number) = result_number(&stroke.key) {
+                self.select_visible_result(number - 1, !stroke.modifiers.shift, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if stroke.modifiers.modified()
+            && !(stroke.key == "tab"
+                && stroke.modifiers.shift
+                && !stroke.modifiers.control
+                && !stroke.modifiers.alt
+                && !stroke.modifiers.platform
+                && !stroke.modifiers.function)
+        {
+            return;
+        }
+        match stroke.key.as_str() {
+            "pageup" => {
+                self.move_selection(-7, cx);
+                cx.stop_propagation();
+            }
+            "pagedown" => {
+                self.move_selection(7, cx);
+                cx.stop_propagation();
+            }
+            "tab" => {
+                self.move_selection(if stroke.modifiers.shift { -1 } else { 1 }, cx);
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.ai.active {
             return;
@@ -640,15 +975,10 @@ impl Moin {
         }
         let home = self.showing_commands(cx);
         let len = self.hits.len() + if home { self.commands.len() } else { 0 };
-        if len == 0 || self.composing(cx) || self.preview_open {
+        if len == 0 || self.composing(cx) {
             return;
         }
-        self.selected = self.selected.saturating_add_signed(delta).min(len - 1);
-        let headings =
-            1 + usize::from(home && !self.hits.is_empty() && self.selected >= self.hits.len());
-        self.scroll.scroll_to_item(self.selected + headings);
-        self.notice = None;
-        cx.notify();
+        self.select_result(self.selected.saturating_add_signed(delta), cx);
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -784,14 +1114,37 @@ impl Moin {
             cx.notify();
             return;
         }
+        if self.composing(cx) {
+            return;
+        }
         if self.preview_open {
             self.preview_open = false;
             cx.notify();
             return;
         }
-        if self.plugins.recognizes(&self.query(cx)) {
-            self.input.update(cx, |input, cx| input.clear(cx));
-            self.refresh(cx);
+        let query = self.query(cx);
+        if !query.is_empty() {
+            let replacement = if self.plugins.recognizes(&query) {
+                let prefix = if query.starts_with('=') {
+                    "="
+                } else {
+                    query.split_whitespace().next().unwrap_or_default()
+                };
+                if query == prefix {
+                    String::new()
+                } else {
+                    format!("{prefix} ")
+                }
+            } else {
+                String::new()
+            };
+            self.input
+                .update(cx, |input, cx| input.set_value(replacement, cx));
+            self.input.read(cx).focus(window, cx);
+            return;
+        }
+        if self.mode != SearchMode::All {
+            self.set_mode(SearchMode::All, window, cx);
             return;
         }
         if !self.composing(cx) && !self.folder_picker_open {
@@ -811,8 +1164,8 @@ impl Moin {
             }
         } else if let Some(hit) = self.hits.get(self.selected) {
             actions.push((ResultAction::Run, "打开", "\u{e8a7}", "Enter"));
-            if hit.chunk.is_some() {
-                actions.push((ResultAction::Preview, "预览正文", "\u{e8a5}", "Ctrl+P"));
+            if hit.kind != HitKind::App {
+                actions.push((ResultAction::Preview, "展开预览", "\u{e8a5}", "Ctrl+P"));
             }
             actions.push((
                 ResultAction::Copy,
@@ -929,7 +1282,7 @@ impl Moin {
         if self
             .hits
             .get(self.selected)
-            .is_some_and(|hit| hit.chunk.is_some())
+            .is_some_and(|hit| hit.kind != HitKind::App)
         {
             self.preview_open = !self.preview_open;
             cx.notify();
@@ -1002,9 +1355,42 @@ impl Moin {
             })
             .child(
                 control("ai-mode", "AI 对话")
-                    .child(keycap("Ctrl+5"))
+                    .child(keycap(
+                        self.configured_command_key(&Command::Ai)
+                            .unwrap_or("Ctrl+5".into()),
+                    ))
                     .on_click(cx.listener(|view, _, window, cx| view.set_ai(true, window, cx))),
             )
+    }
+
+    fn configured_command_key(&self, command: &Command) -> Option<String> {
+        use moin::hotkey::FeatureAction;
+        let feature = match command {
+            Command::Scope(SearchMode::Apps) => FeatureAction::Apps,
+            Command::Scope(SearchMode::Files) => FeatureAction::Files,
+            Command::Scope(SearchMode::Text) => FeatureAction::Text,
+            Command::Scope(SearchMode::All) => FeatureAction::All,
+            Command::Ai => FeatureAction::Ai,
+            Command::Plugin(prefix, _) => match prefix.as_str() {
+                "=" => FeatureAction::Calculator,
+                "翻译" => FeatureAction::Translation,
+                "词典" => FeatureAction::Dictionary,
+                "换算" => FeatureAction::UnitConverter,
+                _ => return None,
+            },
+        };
+        let key = self.config.feature_shortcuts.get(feature);
+        (!key.is_empty()).then(|| {
+            // A configured global Control chord must not be rendered as Command.
+            // The legacy keycap conversion still maps in-app Ctrl fallbacks to Cmd.
+            if cfg!(target_os = "macos") {
+                key.replace("Ctrl", "⌃")
+                    .replace("Cmd", "⌘")
+                    .replace("Alt", "⌥")
+            } else {
+                key.to_owned()
+            }
+        })
     }
 
     fn listing(&self, query: &str, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1012,6 +1398,7 @@ impl Moin {
         let mut list = div()
             .id("entries")
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .overflow_y_scroll()
             .py(px(8.))
@@ -1037,7 +1424,9 @@ impl Moin {
             list = list.child(section_label(label));
             for (i, hit) in self.hits.iter().enumerate() {
                 let (glyph, label, color) = hit_style(hit.kind);
-                let detail = if hit.kind == HitKind::Text {
+                let detail = if self.preview_key.is_some() {
+                    String::new()
+                } else if hit.kind == HitKind::Text {
                     collapse(&hit.excerpt)
                 } else if matches!(hit.kind, HitKind::File | HitKind::Folder) {
                     hit.path
@@ -1053,12 +1442,14 @@ impl Moin {
                 list = list.child(
                     entry(("hit", i), symbol, hit.title.clone(), detail, active)
                         .when(!home, |entry| entry.child(kind_label(label)))
-                        .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
-                            view.selected = i;
-                            view.notice = None;
-                            view.open_selected(window, cx);
+                        .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                            view.select_result(i, cx);
+                            if view.hits.get(i).is_some_and(|hit| hit.kind == HitKind::App)
+                                || event.click_count() >= 2
+                            {
+                                view.open_selected(window, cx);
+                            }
                             view.input.read(cx).focus(window, cx);
-                            cx.notify();
                         })),
                 );
             }
@@ -1108,6 +1499,9 @@ impl Moin {
                         (title.to_owned(), explanation.to_owned(), glyph, color, None)
                     }
                 };
+                let key = self
+                    .configured_command_key(command)
+                    .or_else(|| key.map(str::to_owned));
                 list = list.child(
                     entry(
                         ("command", i),
@@ -1135,55 +1529,233 @@ impl Moin {
         list
     }
 
-    fn preview(&self, hit: &Hit, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn search_results(&self, query: &str, window: &mut Window, cx: &mut Context<Self>) -> Div {
         div()
-            .id("passage-preview")
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(self.listing(query, window, cx))
+            .when(self.preview_key.is_some(), |body| {
+                body.child(
+                    div()
+                        .w(relative(0.42))
+                        .min_w(px(280.))
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .border_l_1()
+                        .border_color(rgba(LINE))
+                        .bg(rgba(0x00000012))
+                        .child(self.file_preview_panel(cx)),
+                )
+            })
+    }
+
+    fn file_preview_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut pane = div()
+            .id("file-preview")
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .overflow_y_scroll()
-            .px(px(26.))
+            .px(px(20.))
             .py(px(18.))
+            .flex()
+            .flex_col()
+            .gap(px(12.));
+        pane = pane.child(
+            row()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(rem(12.))
+                        .text_color(rgb(MUTED))
+                        .child("文件预览"),
+                )
+                .child(
+                    control(
+                        "expand-file-preview",
+                        if self.preview_open {
+                            "返回结果"
+                        } else {
+                            "展开"
+                        },
+                    )
+                    .text_size(rem(12.))
+                    .child(keycap("Ctrl+P"))
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_preview(cx))),
+                ),
+        );
+        if self.preview_loading {
+            return pane.child(
+                div()
+                    .text_size(rem(14.))
+                    .text_color(rgb(MUTED))
+                    .child("正在读取预览…"),
+            );
+        }
+        if let Some(error) = &self.preview_error {
+            return pane.child(
+                div()
+                    .text_size(rem(14.))
+                    .line_height(rem(22.))
+                    .text_color(rgb(0xffb4a5))
+                    .child(error.clone()),
+            );
+        }
+        let Some(preview) = &self.file_preview else {
+            return pane;
+        };
+        pane = pane
             .child(
-                row()
-                    .justify_between()
-                    .gap_4()
+                div()
+                    .text_size(rem(18.))
+                    .line_height(rem(27.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(preview.title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(rem(12.))
+                    .line_height(rem(19.))
+                    .text_color(rgb(MUTED))
+                    .child(preview.path.display().to_string()),
+            );
+        let metadata = [
+            Some(preview.kind.clone()),
+            preview.size.map(preview::size_label),
+            preview.modified.map(preview::modified_label),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        pane = pane.child(
+            div()
+                .text_size(rem(12.))
+                .line_height(rem(19.))
+                .text_color(rgb(MUTED))
+                .child(metadata),
+        );
+        match &preview.content {
+            preview::Content::Text {
+                text,
+                truncated,
+                chunk,
+            } => {
+                if let Some(chunk) = chunk {
+                    pane = pane.child(
+                        div()
+                            .text_size(rem(12.))
+                            .text_color(rgb(LIME))
+                            .child(format!("命中片段 {chunk}")),
+                    );
+                }
+                pane = pane.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .rounded(px(6.))
+                        .p(px(12.))
+                        .bg(rgba(0x00000024))
+                        .text_size(rem(13.))
+                        .line_height(rem(22.))
+                        .child(if text.is_empty() {
+                            "文件为空".to_owned()
+                        } else {
+                            text.clone()
+                        }),
+                );
+                if *truncated {
+                    pane = pane.child(
+                        div()
+                            .text_size(rem(12.))
+                            .text_color(rgb(MUTED))
+                            .child("仅显示文件开头，按 Enter 打开完整内容。"),
+                    );
+                }
+            }
+            preview::Content::Image { width, height } => {
+                pane = pane
                     .child(
                         div()
-                            .text_size(rem(14.))
+                            .text_size(rem(12.))
                             .text_color(rgb(MUTED))
-                            .child(format!("正文片段 {}", hit.chunk.unwrap_or_default())),
+                            .child(format!("{width} × {height}")),
                     )
                     .child(
-                        control("back-to-results", "返回结果")
-                            .child(keycap("Ctrl+P"))
-                            .on_click(cx.listener(|view, _, _, cx| view.toggle_preview(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(rem(23.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .truncate()
-                    .child(hit.title.clone()),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_size(rem(13.))
-                    .text_color(rgb(MUTED))
-                    .truncate()
-                    .child(hit.path.display().to_string()),
-            )
-            .child(
-                div()
-                    .mt_4()
-                    .p_4()
-                    .rounded(px(8.))
-                    .bg(rgba(0x12080757))
-                    .text_size(rem(16.))
-                    .line_height(rem(26.))
-                    .child(hit.excerpt.clone()),
-            )
+                        img(preview.path.clone())
+                            .w_full()
+                            .h(px(230.))
+                            .object_fit(ObjectFit::Contain)
+                            .with_loading(|| {
+                                div()
+                                    .text_size(rem(13.))
+                                    .child("正在加载图片…")
+                                    .into_any_element()
+                            })
+                            .with_fallback(|| {
+                                div()
+                                    .text_size(rem(13.))
+                                    .child("图片无法加载，按 Enter 用默认应用打开。")
+                                    .into_any_element()
+                            }),
+                    );
+            }
+            preview::Content::Directory { entries, truncated } => {
+                if entries.is_empty() {
+                    pane = pane.child(
+                        div()
+                            .text_size(rem(13.))
+                            .text_color(rgb(MUTED))
+                            .child("文件夹为空"),
+                    );
+                }
+                for (index, (name, directory)) in entries.iter().enumerate() {
+                    pane = pane.child(
+                        row()
+                            .gap(px(8.))
+                            .min_h(rem(24.))
+                            .min_w_0()
+                            .child(glyph(
+                                if *directory { "\u{e8b7}" } else { "\u{e8a5}" },
+                                14.,
+                                MUTED,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(rem(13.))
+                                    .child(name.clone()),
+                            )
+                            .id(("folder-preview-entry", index)),
+                    );
+                }
+                if *truncated {
+                    pane = pane.child(
+                        div()
+                            .text_size(rem(12.))
+                            .text_color(rgb(MUTED))
+                            .child("最多显示前 80 项，按 Enter 打开文件夹。"),
+                    );
+                }
+            }
+            preview::Content::Metadata(message) => {
+                pane = pane.child(
+                    div()
+                        .text_size(rem(13.))
+                        .line_height(rem(22.))
+                        .text_color(rgb(MUTED))
+                        .child(message.clone()),
+                );
+            }
+        }
+        pane
     }
 
     fn plugin_view(&self, query: &str, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1322,13 +1894,21 @@ impl Render for Moin {
             self.ai.pane.clone().into_any_element()
         } else if plugin {
             self.plugin_view(&query, cx).into_any_element()
-        } else if let Some(hit) = self.hits.get(self.selected).filter(|_| self.preview_open) {
-            self.preview(hit, cx).into_any_element()
+        } else if self.preview_open && self.preview_key.is_some() {
+            self.file_preview_panel(cx).into_any_element()
         } else {
-            self.listing(&query, window, cx).into_any_element()
+            self.search_results(&query, window, cx).into_any_element()
         };
         div()
             .key_context("Moin")
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.palette_key(event, window, cx)
+            }))
+            .on_action(cx.listener(|view, _: &input::Backspace, window, cx| {
+                if !view.ai.active && view.query(cx).is_empty() {
+                    view.return_to_parent(window, cx);
+                }
+            }))
             .on_action(cx.listener(|view, _: &Next, _, cx| view.move_selection(1, cx)))
             .on_action(cx.listener(|view, _: &Previous, _, cx| view.move_selection(-1, cx)))
             .on_action(cx.listener(|view, _: &Confirm, window, cx| view.confirm(window, cx)))
@@ -1402,6 +1982,31 @@ impl Render for Moin {
 
 fn row() -> Div {
     div().flex().items_center()
+}
+
+/// Command Palette aliases enter a search page only once the delimiter is typed.
+fn parse_scope_prefix(value: &str) -> Option<(SearchMode, String)> {
+    let value = value.trim_start();
+    let end = value.find(char::is_whitespace)?;
+    let mode = match value[..end].to_ascii_lowercase().as_str() {
+        "file" | "files" | "文件" => SearchMode::Files,
+        "app" | "apps" | "应用" => SearchMode::Apps,
+        "text" | "正文" => SearchMode::Text,
+        _ => return None,
+    };
+    Some((mode, value[end..].trim_start().to_owned()))
+}
+
+fn result_number(key: &str) -> Option<usize> {
+    if let Ok(number @ 1..=9) = key.parse::<usize>() {
+        return Some(number);
+    }
+    // GPUI reports the printable character for shifted number-row keys.
+    key.chars()
+        .next()
+        .filter(|_| key.chars().count() == 1)
+        .and_then(|key| "!@#$%^&*(".chars().position(|shifted| shifted == key))
+        .map(|index| index + 1)
 }
 
 fn glyph(icon: &'static str, size: f32, color: u32) -> Div {
@@ -1522,7 +2127,7 @@ fn entry(
                 .gap(px(15.))
                 .child(
                     div()
-                        .max_w(relative(0.56))
+                        .when(!detail.is_empty(), |title| title.max_w(relative(0.56)))
                         .truncate()
                         .text_size(rem(16.))
                         .child(title),
@@ -1574,7 +2179,7 @@ fn control(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful
         .child(label.into())
 }
 
-fn keycap(key: &'static str) -> Div {
+fn keycap(key: impl AsRef<str>) -> Div {
     div()
         .flex_shrink_0()
         .px(px(7.))
@@ -1585,7 +2190,7 @@ fn keycap(key: &'static str) -> Div {
         .bg(rgba(0xffffff0e))
         .text_size(rem(12.))
         .text_color(rgb(MUTED))
-        .child(appearance::shortcut_label(key))
+        .child(appearance::shortcut_label(key.as_ref()))
 }
 
 #[cfg(windows)]
@@ -1649,6 +2254,23 @@ pub fn listen_to_tray(
                     );
                     cx.notify();
                 }),
+                TrayEvent::ActivateFeature(feature) => handle.update(cx, |view, window, cx| {
+                    if view.folder_picker_open {
+                        return;
+                    }
+                    let key = view.config.feature_shortcuts.get(feature).to_owned();
+                    if let Some(settings) = view.settings_window {
+                        if settings
+                            .update(cx, |settings, window, cx| {
+                                settings.capture_registered_hotkey(&key, window, cx)
+                            })
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
+                    }
+                    view.activate_feature(feature, window, cx);
+                }),
                 TrayEvent::Show | TrayEvent::Toggle => handle.update(cx, |view, window, cx| {
                     if view.folder_picker_open {
                         return;
@@ -1682,4 +2304,37 @@ pub fn listen_to_tray(
         let _ = cx.update(|app| app.quit());
     })
     .detach();
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::{parse_scope_prefix, result_number};
+    use moin::search::index::SearchMode;
+    #[::core::prelude::v1::test]
+    fn scope_aliases_require_space_and_preserve_query() {
+        assert_eq!(parse_scope_prefix("file"), None);
+        assert_eq!(parse_scope_prefix("file.txt"), None);
+        assert_eq!(
+            parse_scope_prefix(" File  C:\\资料\\交接.md"),
+            Some((SearchMode::Files, "C:\\资料\\交接.md".into()))
+        );
+        assert_eq!(
+            parse_scope_prefix("apps "),
+            Some((SearchMode::Apps, String::new()))
+        );
+        assert_eq!(
+            parse_scope_prefix("正文\t检索内容"),
+            Some((SearchMode::Text, "检索内容".into()))
+        );
+        assert_eq!(parse_scope_prefix("搜索 file 内容"), None);
+    }
+    #[::core::prelude::v1::test]
+    fn shifted_number_row_keys_still_select_the_corresponding_result() {
+        for (index, key) in "!@#$%^&*(".chars().enumerate() {
+            assert_eq!(result_number(&key.to_string()), Some(index + 1));
+        }
+        assert_eq!(result_number("9"), Some(9));
+        assert_eq!(result_number("0"), None);
+        assert_eq!(result_number("pageup"), None);
+    }
 }

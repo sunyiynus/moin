@@ -1,10 +1,12 @@
 use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 
 /// A global shortcut, represented independently of the desktop UI.
 ///
 /// Key values use stable logical (Windows virtual-key) codes on every platform.
 /// Native backends translate these codes when registering the shortcut.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Shortcut {
     pub modifiers: u32,
     pub key: u32,
@@ -19,6 +21,127 @@ pub const PLATFORM: u32 = WIN;
 
 pub fn default_shortcut() -> String {
     "Alt+Space".into()
+}
+
+/// Optional direct activation targets. These shortcuts work outside Moin too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureAction {
+    All,
+    Apps,
+    Files,
+    Text,
+    Ai,
+    Calculator,
+    Translation,
+    Dictionary,
+    UnitConverter,
+    Settings,
+}
+
+impl FeatureAction {
+    pub const ALL: [Self; 10] = [
+        Self::All,
+        Self::Apps,
+        Self::Files,
+        Self::Text,
+        Self::Ai,
+        Self::Calculator,
+        Self::Translation,
+        Self::Dictionary,
+        Self::UnitConverter,
+        Self::Settings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "首页与全部搜索",
+            Self::Apps => "搜索应用",
+            Self::Files => "搜索文件",
+            Self::Text => "搜索正文",
+            Self::Ai => "AI 对话",
+            Self::Calculator => "计算器",
+            Self::Translation => "翻译",
+            Self::Dictionary => "词典",
+            Self::UnitConverter => "单位换算",
+            Self::Settings => "Moin 设置",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::All => "唤起浮窗并返回首页。",
+            Self::Apps => "唤起浮窗并直接搜索已安装的应用。",
+            Self::Files => "唤起浮窗并直接搜索文件或文件夹。",
+            Self::Text => "唤起浮窗并直接搜索已索引的正文。",
+            Self::Ai => "唤起浮窗并进入 AI 对话。",
+            Self::Calculator => "唤起浮窗并输入计算表达式。",
+            Self::Translation => "唤起浮窗并输入要翻译的内容。",
+            Self::Dictionary => "唤起浮窗并查询单词。",
+            Self::UnitConverter => "唤起浮窗并输入换算内容。",
+            Self::Settings => "直接打开 Moin 设置窗口。",
+        }
+    }
+
+    pub fn command(self) -> Option<&'static str> {
+        match self {
+            Self::Calculator => Some("="),
+            Self::Translation => Some("翻译"),
+            Self::Dictionary => Some("词典"),
+            Self::UnitConverter => Some("换算"),
+            _ => None,
+        }
+    }
+}
+
+/// Empty entries are unassigned; defaults never reserve other apps' shortcuts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FeatureShortcuts(pub BTreeMap<FeatureAction, String>);
+
+impl FeatureShortcuts {
+    pub fn get(&self, feature: FeatureAction) -> &str {
+        self.0.get(&feature).map_or("", String::as_str)
+    }
+
+    pub fn set(&mut self, feature: FeatureAction, shortcut: String) {
+        if shortcut.trim().is_empty() {
+            self.0.remove(&feature);
+        } else {
+            self.0.insert(feature, shortcut);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (FeatureAction, &str)> {
+        self.0.iter().filter_map(|(&feature, text)| {
+            (!text.trim().is_empty()).then_some((feature, text.as_str()))
+        })
+    }
+
+    pub fn parsed(&self) -> Result<Vec<(FeatureAction, Shortcut)>> {
+        self.iter()
+            .map(|(feature, text)| Ok((feature, Shortcut::parse(text)?)))
+            .collect()
+    }
+
+    pub fn normalized(&self, activation: &str) -> Result<Self> {
+        let activation = Shortcut::parse(activation)?;
+        let mut used = HashSet::new();
+        used.insert(activation);
+        let mut normalized = Self::default();
+        for (feature, text) in self.iter() {
+            let shortcut = Shortcut::parse(text)
+                .map_err(|error| anyhow::anyhow!("{}：{error}", feature.label()))?;
+            ensure!(
+                used.insert(shortcut),
+                "{}：快捷键 {} 已分配给其他功能或主激活快捷键",
+                feature.label(),
+                shortcut.label()
+            );
+            normalized.set(feature, shortcut.label());
+        }
+        Ok(normalized)
+    }
 }
 
 impl Shortcut {
@@ -209,6 +332,49 @@ fn key_label(key: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_shortcuts_normalize_and_reject_overlapping_global_keys() {
+        let mut features = FeatureShortcuts::default();
+        features.set(FeatureAction::Files, " control + shift + f ".into());
+        features.set(FeatureAction::Ai, "Alt+Shift+A".into());
+        let normalized = features.normalized("Alt+Space").unwrap();
+        assert_eq!(normalized.get(FeatureAction::Files), "Ctrl+Shift+F");
+        assert_eq!(normalized.parsed().unwrap().len(), 2);
+
+        features.set(FeatureAction::Calculator, "Ctrl+Shift+F".into());
+        assert!(features.normalized("Alt+Space").is_err());
+        features.set(FeatureAction::Calculator, "Alt+Space".into());
+        assert!(features.normalized("Alt+Space").is_err());
+        features.set(FeatureAction::Calculator, "Ctrl".into());
+        assert!(
+            features
+                .normalized("Alt+Space")
+                .unwrap_err()
+                .to_string()
+                .contains("计算器")
+        );
+    }
+
+    #[test]
+    fn feature_shortcuts_round_trip_all_supported_targets_and_clear_bindings() {
+        let mut features = FeatureShortcuts::default();
+        for (index, feature) in FeatureAction::ALL.into_iter().enumerate() {
+            features.set(feature, format!("Ctrl+Alt+{}", index));
+        }
+        let normalized = features.normalized("Alt+Space").unwrap();
+        let restored: FeatureShortcuts =
+            serde_json::from_str(&serde_json::to_string(&normalized).unwrap()).unwrap();
+        assert_eq!(restored, normalized);
+        assert_eq!(restored.parsed().unwrap().len(), FeatureAction::ALL.len());
+        let mut cleared = restored;
+        cleared.set(FeatureAction::Ai, String::new());
+        assert_eq!(cleared.get(FeatureAction::Ai), "");
+        assert_eq!(
+            cleared.parsed().unwrap().len(),
+            FeatureAction::ALL.len() - 1
+        );
+    }
 
     #[test]
     fn normalizes_shortcuts_and_rejects_invalid_combinations() {

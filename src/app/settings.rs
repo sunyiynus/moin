@@ -13,7 +13,7 @@ use moin::{
     config::{
         AI_FONT_SIZE_MAX, AI_FONT_SIZE_MIN, AppearanceConfig, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
     },
-    hotkey::{self, Shortcut},
+    hotkey::{self, FeatureAction, FeatureShortcuts, Shortcut},
 };
 
 // Fluent settings: a quiet navigation surface, white setting rows and one accent.
@@ -62,6 +62,9 @@ pub struct Snapshot {
     pub activation_hotkey: String,
     pub hotkey_busy: bool,
     pub hotkey_error: Option<String>,
+    pub feature_shortcuts: FeatureShortcuts,
+    pub feature_shortcuts_busy: bool,
+    pub feature_shortcuts_error: Option<String>,
     pub vector_status: String,
     pub ai_config: AiConfig,
     pub ai_error: Option<String>,
@@ -80,6 +83,7 @@ enum Page {
     Ai,
     Appearance,
     App,
+    Shortcuts,
 }
 
 impl Page {
@@ -91,6 +95,7 @@ impl Page {
             Self::Ai => "AI 助手",
             Self::Appearance => "外观",
             Self::App => "常规",
+            Self::Shortcuts => "快捷键",
         }
     }
 
@@ -108,6 +113,7 @@ impl Page {
             Self::Ai => "配置浮窗对话使用的模型，以及本地文档检索。",
             Self::Appearance => "分别调整 AI 对话与其余界面的字体和字号。",
             Self::App => "设置 Moin 的激活快捷键，查看应用信息。",
+            Self::Shortcuts => "为各功能分配全局快捷键，直接唤起浮窗并进入对应功能。",
         }
     }
 
@@ -119,6 +125,7 @@ impl Page {
             Self::Ai => "\u{e8f2}",
             Self::Appearance => "\u{e8d2}",
             Self::App => "\u{e713}",
+            Self::Shortcuts => "\u{e765}",
         }
     }
 }
@@ -136,6 +143,9 @@ pub struct Settings {
     hotkey_recording: bool,
     hotkey_focus: FocusHandle,
     hotkey_capture_error: Option<String>,
+    feature_draft: FeatureShortcuts,
+    feature_recording: Option<FeatureAction>,
+    feature_focus: std::collections::BTreeMap<FeatureAction, FocusHandle>,
     ai_provider: AiProvider,
     ai_base_url: Entity<SearchInput>,
     ai_model: Entity<SearchInput>,
@@ -243,6 +253,12 @@ fn open_page(
                     hotkey_recording: false,
                     hotkey_focus: cx.focus_handle(),
                     hotkey_capture_error: None,
+                    feature_draft: snapshot.feature_shortcuts,
+                    feature_recording: None,
+                    feature_focus: FeatureAction::ALL
+                        .into_iter()
+                        .map(|feature| (feature, cx.focus_handle()))
+                        .collect(),
                     ai_provider: config.provider,
                     ai_base_url,
                     ai_model,
@@ -279,6 +295,7 @@ impl Render for Settings {
             Page::Ai => self.ai_page(snapshot, cx),
             Page::Appearance => self.appearance_page(snapshot, cx),
             Page::App => self.app_page(snapshot, cx),
+            Page::Shortcuts => self.shortcuts_page(snapshot, cx),
         };
         div()
             .size_full()
@@ -288,7 +305,7 @@ impl Render for Settings {
             .text_color(rgb(INK))
             .font_family(ui_font_family)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                if view.hotkey_recording && view.hotkey_focus.is_focused(window) {
+                if view.hotkey_recording && view.recording_focus().is_focused(window) {
                     view.capture_hotkey(event, cx);
                     cx.stop_propagation();
                 } else if view.hotkey_recording {
@@ -352,13 +369,11 @@ impl Settings {
     ) -> bool {
         if !self.hotkey_recording
             || !window.is_window_active()
-            || !self.hotkey_focus.is_focused(window)
+            || !self.recording_focus().is_focused(window)
         {
             return false;
         }
-        self.hotkey_draft = shortcut.to_owned();
-        self.hotkey_recording = false;
-        self.hotkey_capture_error = None;
+        self.assign_captured_shortcut(shortcut.to_owned());
         cx.notify();
         true
     }
@@ -402,6 +417,7 @@ impl Settings {
                     .children(
                         [
                             Page::App,
+                            Page::Shortcuts,
                             Page::Appearance,
                             Page::Search,
                             Page::Index,
@@ -1104,10 +1120,97 @@ impl Settings {
             )
     }
 
+    fn recording_focus(&self) -> &FocusHandle {
+        self.feature_recording
+            .and_then(|feature| self.feature_focus.get(&feature))
+            .unwrap_or(&self.hotkey_focus)
+    }
+
+    fn assign_captured_shortcut(&mut self, shortcut: String) {
+        if let Some(feature) = self.feature_recording.take() {
+            self.feature_draft.set(feature, shortcut);
+        } else {
+            self.hotkey_draft = shortcut;
+        }
+        self.hotkey_recording = false;
+        self.hotkey_capture_error = None;
+    }
+
+    fn shortcuts_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
+        let busy = snapshot.feature_shortcuts_busy || snapshot.hotkey_busy;
+        let dirty = self.feature_draft != snapshot.feature_shortcuts;
+        let can_save = !busy
+            && !self.hotkey_recording
+            && (dirty || snapshot.feature_shortcuts_error.is_some());
+        column().gap(px(24.))
+            .child(section("功能激活")
+                .child(description(format!("主激活快捷键为 {}，可在「常规」中修改。以下快捷键在 Moin 常驻时全局生效，留空表示不分配。", snapshot.activation_hotkey)))
+                .children(FeatureAction::ALL.into_iter().map(|feature| {
+                    let recording = self.hotkey_recording && self.feature_recording == Some(feature);
+                    let value = self.feature_draft.get(feature);
+                    let focus = self.feature_focus.get(&feature).expect("feature focus");
+                    setting_row("\u{e765}", feature.label(), feature.description())
+                        .child(row().flex_wrap().gap(px(6.))
+                            .child(row().id(("feature-hotkey", feature as usize))
+                                .track_focus(focus).tab_index(0)
+                                .min_w(px(168.)).min_h(rem(34.))
+                                .px(px(12.)).py(px(4.)).justify_center()
+                                .rounded(px(4.)).border_1()
+                                .border_color(rgb(if recording { ACCENT } else { 0xd1d1d1 }))
+                                .bg(rgb(if recording { TINT } else { WHITE }))
+                                .focus(|style| style.border_color(rgb(ACCENT)))
+                                .child(title(if recording { "请按组合键…".to_owned() }
+                                    else if value.is_empty() { "未分配".to_owned() }
+                                    else { value.to_owned() }, 14.))
+                                .when(!busy, |control| control.cursor_pointer()
+                                    .hover(|style| style.bg(rgb(TINT)))
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.feature_recording = Some(feature);
+                                        view.hotkey_recording = true;
+                                        view.hotkey_capture_error = None;
+                                        view.recording_focus().focus(window);
+                                        cx.notify();
+                                    }))))
+                            .child(button(("clear-feature-hotkey", feature as usize), "清除", false, !busy && !value.is_empty())
+                                .when(!busy && !value.is_empty(), |control| control.on_click(cx.listener(move |view, _, _, cx| {
+                                    view.feature_draft.set(feature, String::new());
+                                    view.hotkey_recording = false;
+                                    view.feature_recording = None;
+                                    view.hotkey_capture_error = None;
+                                    cx.notify();
+                                })))))
+                })))
+            .child(column().gap(px(10.))
+                .child(row().flex_wrap().gap(px(8.))
+                    .child(button("save-feature-hotkeys", if busy { "正在保存" } else { "保存功能快捷键" }, true, can_save)
+                        .when(can_save, |control| control.on_click(cx.listener(|view, _, _, cx| {
+                            let draft = view.feature_draft.clone();
+                            view.hotkey_capture_error = None;
+                            view.launcher.update(cx, |launcher, cx| launcher.save_feature_shortcuts(draft, cx));
+                        }))))
+                    .child(button("restore-feature-hotkeys", "还原已保存设置", false, !busy && dirty)
+                        .when(!busy && dirty, |control| control.on_click(cx.listener(|view, _, _, cx| {
+                            view.feature_draft = view.launcher.read(cx).settings_snapshot().feature_shortcuts;
+                            view.hotkey_recording = false;
+                            view.feature_recording = None;
+                            view.hotkey_capture_error = None;
+                            cx.notify();
+                        })))))
+                .child(description(if self.hotkey_recording {
+                    "按下新的组合键；按 Esc 取消录制。".to_owned()
+                } else if dirty {
+                    "有未保存的修改。保存后立即生效，快捷键冲突时保留原配置。".to_owned()
+                } else {
+                    "点击按键框录制组合键，保存后立即生效。".to_owned()
+                }))
+                .children(self.hotkey_capture_error.clone().or(snapshot.feature_shortcuts_error).into_iter().map(error_message)))
+    }
+
     fn capture_hotkey(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = &event.keystroke.key;
         if key == "escape" && !event.keystroke.modifiers.modified() {
             self.hotkey_recording = false;
+            self.feature_recording = None;
             self.hotkey_capture_error = None;
             cx.notify();
             return;
@@ -1136,9 +1239,7 @@ impl Settings {
         }
         match Shortcut::from_key(key, mask) {
             Ok(shortcut) => {
-                self.hotkey_draft = shortcut.label();
-                self.hotkey_recording = false;
-                self.hotkey_capture_error = None;
+                self.assign_captured_shortcut(shortcut.label());
             }
             Err(error) => self.hotkey_capture_error = Some(error.to_string()),
         }
@@ -1148,10 +1249,10 @@ impl Settings {
     fn app_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
         let path = snapshot.data_dir.to_string_lossy().into_owned();
         let directory = snapshot.data_dir;
+        let busy = snapshot.hotkey_busy || snapshot.feature_shortcuts_busy;
         let changed = self.hotkey_draft != snapshot.activation_hotkey;
-        let can_save = !snapshot.hotkey_busy
-            && !self.hotkey_recording
-            && (changed || snapshot.hotkey_error.is_some());
+        let can_save =
+            !busy && !self.hotkey_recording && (changed || snapshot.hotkey_error.is_some());
         let cli_command = if cfg!(windows) {
             "moin-cli.exe mcp"
         } else {
@@ -1194,11 +1295,12 @@ impl Settings {
                                     },
                                     14.,
                                 ))
-                                .when(!snapshot.hotkey_busy, |control| {
+                                .when(!busy, |control| {
                                     control
                                         .cursor_pointer()
                                         .hover(|style| style.bg(rgb(TINT)))
                                         .on_click(cx.listener(|view, _, window, cx| {
+                                            view.feature_recording = None;
                                             view.hotkey_recording = true;
                                             view.hotkey_capture_error = None;
                                             view.hotkey_focus.focus(window);
@@ -1217,7 +1319,7 @@ impl Settings {
                             .child(
                                 button(
                                     "save-activation-hotkey",
-                                    if snapshot.hotkey_busy {
+                                    if busy {
                                         "正在保存"
                                     } else {
                                         "保存快捷键"
@@ -1236,23 +1338,15 @@ impl Settings {
                                 }),
                             )
                             .child(
-                                button(
-                                    "default-activation-hotkey",
-                                    "恢复默认快捷键",
-                                    false,
-                                    !snapshot.hotkey_busy,
-                                )
-                                .when(
-                                    !snapshot.hotkey_busy,
-                                    |control| {
+                                button("default-activation-hotkey", "恢复默认快捷键", false, !busy)
+                                    .when(!busy, |control| {
                                         control.on_click(cx.listener(|view, _, _, cx| {
                                             view.hotkey_draft = hotkey::default_shortcut();
                                             view.hotkey_recording = false;
                                             view.hotkey_capture_error = None;
                                             cx.notify();
                                         }))
-                                    },
-                                ),
+                                    }),
                             ),
                     )
                     .child(description(if changed {

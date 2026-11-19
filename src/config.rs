@@ -14,6 +14,8 @@ pub struct Config {
     pub roots: Vec<PathBuf>,
     #[serde(default = "crate::hotkey::default_shortcut")]
     pub activation_hotkey: String,
+    #[serde(default)]
+    pub feature_shortcuts: crate::hotkey::FeatureShortcuts,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_apps: Vec<RecentApp>,
     #[serde(default)]
@@ -31,6 +33,7 @@ impl Default for Config {
         Self {
             roots: crate::search::index::default_roots(),
             activation_hotkey: crate::hotkey::default_shortcut(),
+            feature_shortcuts: crate::hotkey::FeatureShortcuts::default(),
             recent_apps: Vec::new(),
             appearance: AppearanceConfig::default(),
             everything: EverythingConfig::default(),
@@ -177,9 +180,13 @@ mod tests {
         let folder = tempfile::tempdir()?;
         let mut config = Config::load(folder.path())?;
         assert_eq!(config.activation_hotkey, "Alt+Space");
+        assert!(config.feature_shortcuts.iter().next().is_none());
         assert_eq!(config.appearance, AppearanceConfig::default());
         assert!(config.everything.enabled);
         config.activation_hotkey = "Ctrl+Shift+K".into();
+        config
+            .feature_shortcuts
+            .set(crate::hotkey::FeatureAction::Ai, "Ctrl+Alt+A".into());
         config.appearance.ui_font_size = 18.0;
         config.appearance.ai_font_family = "Microsoft YaHei UI".into();
         config.ai.model = "qwen2.5:3b".into();
@@ -196,6 +203,12 @@ mod tests {
 
         let restored = Config::load(folder.path())?;
         assert_eq!(restored.activation_hotkey, "Ctrl+Shift+K");
+        assert_eq!(
+            restored
+                .feature_shortcuts
+                .get(crate::hotkey::FeatureAction::Ai),
+            "Ctrl+Alt+A"
+        );
         assert_eq!(restored.appearance.ui_font_size, 18.0);
         assert_eq!(restored.appearance.ai_font_family, "Microsoft YaHei UI");
         assert_eq!(restored.ai.model, "qwen2.5:3b");

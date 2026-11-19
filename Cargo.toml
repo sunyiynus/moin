@@ -16,6 +16,7 @@ directories = "6"
 extism = { version = "=1.41.0", default-features = false }
 futures = "0.3"
 gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+image = { version = "0.25", default-features = false }
 lancedb = { version = "=0.23.1", default-features = false }
 meval = "0.2"
 plist = "1"
@@ -41,7 +42,6 @@ raw-window-handle = "0.6"
 tray-icon = { version = "=0.26.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"
 windows = { version = "0.61", features = [
     "Win32_Foundation",

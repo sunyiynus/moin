@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
-use moin::hotkey::Shortcut;
+use moin::hotkey::{FeatureAction, FeatureShortcuts, Shortcut};
 use std::{
-    cell::Cell,
-    collections::VecDeque,
+    cell::{Cell, RefCell},
+    collections::{HashSet, VecDeque},
     ffi::c_void,
     mem::size_of,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -58,6 +58,7 @@ pub enum TrayEvent {
     Show,
     Quit,
     HotkeyChanged(Option<String>),
+    ActivateFeature(FeatureAction),
 }
 
 pub enum TrayStart {
@@ -71,9 +72,15 @@ pub struct Tray {
     worker: Option<JoinHandle<()>>,
 }
 
-struct HotkeyRequest {
-    shortcut: Option<Shortcut>,
-    response: Sender<Result<String>>,
+enum HotkeyRequest {
+    Activation {
+        shortcut: Option<Shortcut>,
+        response: Sender<Result<String>>,
+    },
+    Features {
+        shortcuts: Vec<(FeatureAction, Shortcut)>,
+        response: Sender<Result<()>>,
+    },
 }
 
 #[derive(Clone)]
@@ -92,13 +99,31 @@ impl TrayController {
         self.queue_hotkey(None)
     }
 
+    pub fn change_feature_hotkeys(
+        &self,
+        shortcuts: &FeatureShortcuts,
+    ) -> Result<Receiver<Result<()>>> {
+        let shortcuts = shortcuts.parsed()?;
+        let (response, receiver) = async_channel::bounded(1);
+        self.queue_request(HotkeyRequest::Features {
+            shortcuts,
+            response,
+        })?;
+        Ok(receiver)
+    }
+
     fn queue_hotkey(&self, shortcut: Option<Shortcut>) -> Result<Receiver<Result<String>>> {
         let (response, receiver) = async_channel::bounded(1);
+        self.queue_request(HotkeyRequest::Activation { shortcut, response })?;
+        Ok(receiver)
+    }
+
+    fn queue_request(&self, request: HotkeyRequest) -> Result<()> {
         let mut requests = self
             .requests
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        requests.push_back(HotkeyRequest { shortcut, response });
+        requests.push_back(request);
         let posted = unsafe {
             PostMessageW(
                 Some(HWND(self.hwnd as *mut c_void)),
@@ -111,7 +136,7 @@ impl TrayController {
             requests.pop_back();
             return Err(error).context("系统托盘已关闭，无法修改快捷键");
         }
-        Ok(receiver)
+        Ok(())
     }
 }
 
@@ -211,6 +236,7 @@ struct Host {
     icon: TrayIcon,
     taskbar_created: u32,
     hotkey: Cell<Option<RegisteredHotkey>>,
+    features: RefCell<Vec<RegisteredFeature>>,
     requests: Arc<Mutex<VecDeque<HotkeyRequest>>>,
     version_four: Cell<bool>,
 }
@@ -267,29 +293,59 @@ impl Host {
             let Some(request) = request else {
                 return;
             };
-            let result = if let Some(shortcut) = request.shortcut {
-                replace_shortcut(hwnd, self.hotkey.get(), shortcut).map(Some)
-            } else {
-                match self.hotkey.get() {
-                    Some(registered) => unsafe { UnregisterHotKey(Some(hwnd), registered.id) }
-                        .context("无法恢复快捷键状态")
-                        .map(|()| None),
-                    None => Ok(None),
+            match request {
+                HotkeyRequest::Features {
+                    shortcuts,
+                    response,
+                } => {
+                    let result = replace_feature_shortcuts(
+                        hwnd,
+                        &mut self.features.borrow_mut(),
+                        &shortcuts,
+                        self.hotkey.get().map(|key| key.shortcut),
+                    );
+                    let _ = response.try_send(result);
                 }
-            };
-            let response = match result {
-                Ok(registered) => {
-                    self.hotkey.set(registered);
-                    let label = registered.map(|registered| registered.shortcut.label());
-                    unsafe {
-                        let _ = Shell_NotifyIconW(NIM_MODIFY, &self.icon_data(hwnd));
-                    }
-                    self.emit(TrayEvent::HotkeyChanged(label.clone()));
-                    Ok(label.unwrap_or_default())
+                HotkeyRequest::Activation { shortcut, response } => {
+                    let result = if let Some(shortcut) = shortcut {
+                        if self
+                            .features
+                            .borrow()
+                            .iter()
+                            .any(|feature| feature.registered.shortcut == shortcut)
+                        {
+                            Err(anyhow::anyhow!(
+                                "{} 已分配给功能快捷键，请先修改该功能",
+                                shortcut.label()
+                            ))
+                        } else {
+                            replace_shortcut(hwnd, self.hotkey.get(), shortcut).map(Some)
+                        }
+                    } else {
+                        match self.hotkey.get() {
+                            Some(registered) => {
+                                unsafe { UnregisterHotKey(Some(hwnd), registered.id) }
+                                    .context("无法恢复快捷键状态")
+                                    .map(|()| None)
+                            }
+                            None => Ok(None),
+                        }
+                    };
+                    let result = match result {
+                        Ok(registered) => {
+                            self.hotkey.set(registered);
+                            let label = registered.map(|registered| registered.shortcut.label());
+                            unsafe {
+                                let _ = Shell_NotifyIconW(NIM_MODIFY, &self.icon_data(hwnd));
+                            }
+                            self.emit(TrayEvent::HotkeyChanged(label.clone()));
+                            Ok(label.unwrap_or_default())
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let _ = response.try_send(result);
                 }
-                Err(error) => Err(error),
-            };
-            let _ = request.response.try_send(response);
+            }
         }
     }
 
@@ -359,6 +415,7 @@ fn run_host(
             icon: TrayIcon::new()?,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             hotkey: Cell::new(None),
+            features: RefCell::new(Vec::new()),
             requests,
             version_four: Cell::new(false),
         });
@@ -421,10 +478,118 @@ fn run_host(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RegisteredHotkey {
     id: i32,
     shortcut: Shortcut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegisteredFeature {
+    action: FeatureAction,
+    registered: RegisteredHotkey,
+}
+
+/// Reuse native registrations by key combination, not action. This allows
+/// exchanging two feature keys without unregistering either key first.
+fn replace_feature_shortcuts(
+    hwnd: HWND,
+    current: &mut Vec<RegisteredFeature>,
+    desired: &[(FeatureAction, Shortcut)],
+    activation: Option<Shortcut>,
+) -> Result<()> {
+    let mut keys = HashSet::new();
+    let mut actions = HashSet::new();
+    for &(action, shortcut) in desired {
+        anyhow::ensure!(actions.insert(action), "功能快捷键重复：{}", action.label());
+        anyhow::ensure!(
+            keys.insert(shortcut),
+            "快捷键 {} 已分配给其他功能",
+            shortcut.label()
+        );
+        anyhow::ensure!(
+            Some(shortcut) != activation,
+            "{} 与主激活快捷键冲突",
+            shortcut.label()
+        );
+    }
+    let mut next = Vec::with_capacity(desired.len());
+    let mut staged = Vec::<RegisteredHotkey>::new();
+    for &(action, shortcut) in desired {
+        let registered = if let Some(existing) = current
+            .iter()
+            .find(|feature| feature.registered.shortcut == shortcut)
+        {
+            existing.registered
+        } else {
+            // Main activation uses IDs 1/2. These IDs belong exclusively to the
+            // feature registry and are released before the next transaction.
+            let id = (100..0xbfff)
+                .find(|id| {
+                    !current.iter().any(|feature| feature.registered.id == *id)
+                        && !staged.iter().any(|key| key.id == *id)
+                })
+                .context("功能快捷键数量过多")?;
+            if let Err(error) = register(hwnd, id, shortcut) {
+                for key in &staged {
+                    unsafe {
+                        let _ = UnregisterHotKey(Some(hwnd), key.id);
+                    }
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "{}：{} 已被占用或无法注册，原快捷键保持生效",
+                        action.label(),
+                        shortcut.label()
+                    )
+                });
+            }
+            let key = RegisteredHotkey { id, shortcut };
+            staged.push(key);
+            key
+        };
+        next.push(RegisteredFeature { action, registered });
+    }
+    let obsolete = current
+        .iter()
+        .filter(|feature| {
+            !next
+                .iter()
+                .any(|next| next.registered.id == feature.registered.id)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let mut removed = Vec::<RegisteredHotkey>::new();
+    for obsolete in obsolete {
+        if let Err(error) = unsafe { UnregisterHotKey(Some(hwnd), obsolete.registered.id) } {
+            let mut lost = HashSet::new();
+            let mut restore_errors = Vec::new();
+            for old in &removed {
+                if let Err(error) = register(hwnd, old.id, old.shortcut) {
+                    lost.insert(old.id);
+                    restore_errors.push(format!("{}：{error}", old.shortcut.label()));
+                }
+            }
+            for key in &staged {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), key.id);
+                }
+            }
+            if !restore_errors.is_empty() {
+                // Do not claim a lost OS registration is still available. A
+                // later retry must register it again rather than reuse its ID.
+                current.retain(|feature| !lost.contains(&feature.registered.id));
+                bail!(
+                    "无法释放旧快捷键，且部分快捷键无法恢复：{}；原始错误：{error}",
+                    restore_errors.join("；")
+                );
+            }
+            return Err(error).context("无法释放旧功能快捷键，已恢复原设置");
+        }
+        removed.push(obsolete.registered);
+    }
+    *current = next;
+    Ok(())
 }
 
 fn register_shortcut(hwnd: HWND, preferred: Shortcut) -> Option<RegisteredHotkey> {
@@ -505,6 +670,16 @@ unsafe extern "system" fn window_proc(
             {
                 host.emit(TrayEvent::Toggle)
             }
+            WM_HOTKEY => {
+                if let Some(feature) = host
+                    .features
+                    .borrow()
+                    .iter()
+                    .find(|feature| feature.registered.id as usize == wparam.0)
+                {
+                    host.emit(TrayEvent::ActivateFeature(feature.action));
+                }
+            }
             CHANGE_HOTKEY => host.change_hotkeys(hwnd),
             TRAY_CALLBACK => {
                 if host.version_four.get() {
@@ -529,15 +704,23 @@ unsafe extern "system" fn window_proc(
                 if let Some(registered) = host.hotkey.get() {
                     let _ = UnregisterHotKey(Some(hwnd), registered.id);
                 }
+                for feature in host.features.borrow_mut().drain(..) {
+                    let _ = UnregisterHotKey(Some(hwnd), feature.registered.id);
+                }
                 for request in host
                     .requests
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .drain(..)
                 {
-                    let _ = request
-                        .response
-                        .try_send(Err(anyhow::anyhow!("系统托盘已关闭")));
+                    match request {
+                        HotkeyRequest::Activation { response, .. } => {
+                            let _ = response.try_send(Err(anyhow::anyhow!("系统托盘已关闭")));
+                        }
+                        HotkeyRequest::Features { response, .. } => {
+                            let _ = response.try_send(Err(anyhow::anyhow!("系统托盘已关闭")));
+                        }
+                    }
                 }
                 let _ = Shell_NotifyIconW(NIM_DELETE, &host.icon_data(hwnd));
                 PostQuitMessage(0);
@@ -643,6 +826,135 @@ fn create_mark() -> windows::core::Result<HICON> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_keys_can_swap_and_conflicts_roll_back_all_registrations() -> Result<()> {
+        let hwnd = HWND::default();
+        let candidates = (13..=24)
+            .map(|key| Shortcut::parse(&format!("Ctrl+Alt+Shift+F{key}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut registered = Vec::new();
+        for pair in candidates.windows(2) {
+            if replace_feature_shortcuts(
+                hwnd,
+                &mut registered,
+                &[
+                    (FeatureAction::Apps, pair[0]),
+                    (FeatureAction::Files, pair[1]),
+                ],
+                None,
+            )
+            .is_ok()
+            {
+                break;
+            }
+        }
+        anyhow::ensure!(registered.len() == 2, "找不到可用的功能测试快捷键");
+        let before = registered.clone();
+        replace_feature_shortcuts(
+            hwnd,
+            &mut registered,
+            &[
+                (FeatureAction::Apps, before[1].registered.shortcut),
+                (FeatureAction::Files, before[0].registered.shortcut),
+            ],
+            None,
+        )?;
+        assert_eq!(registered[0].registered, before[1].registered);
+        assert_eq!(registered[1].registered, before[0].registered);
+        let swapped = registered.clone();
+        assert!(
+            replace_feature_shortcuts(
+                hwnd,
+                &mut registered,
+                &[(FeatureAction::Apps, swapped[0].registered.shortcut)],
+                Some(swapped[0].registered.shortcut)
+            )
+            .is_err()
+        );
+        assert_eq!(registered, swapped);
+
+        let occupied = registered
+            .iter()
+            .map(|feature| feature.registered.shortcut)
+            .collect::<Vec<_>>();
+        let worker_candidates = candidates.clone();
+        let worker_occupied = occupied.clone();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        let (check, checked) = std::sync::mpsc::sync_channel::<Shortcut>(1);
+        let (report, reported) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let blocked = worker_candidates.iter().copied().find(|key| {
+                !worker_occupied.contains(key) && register(HWND::default(), 900, *key).is_ok()
+            });
+            let _ = ready.send(blocked);
+            if blocked.is_some() {
+                if let Ok(staged) = checked.recv() {
+                    let old_preserved = worker_occupied.iter().enumerate().all(|(index, key)| {
+                        let id = 910 + index as i32;
+                        if register(HWND::default(), id, *key).is_ok() {
+                            unsafe {
+                                let _ = UnregisterHotKey(None, id);
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    let staged_released = register(HWND::default(), 920, staged).is_ok();
+                    if staged_released {
+                        unsafe {
+                            let _ = UnregisterHotKey(None, 920);
+                        }
+                    }
+                    let _ = report.send((old_preserved, staged_released));
+                }
+                unsafe {
+                    let _ = UnregisterHotKey(None, 900);
+                }
+            }
+        });
+        let blocked = waiting.recv()?.context("找不到可用于冲突测试的快捷键")?;
+        let free = candidates
+            .iter()
+            .copied()
+            .find(|key| {
+                if occupied.contains(key) || *key == blocked {
+                    return false;
+                }
+                if register(hwnd, 950, *key).is_ok() {
+                    unsafe {
+                        let _ = UnregisterHotKey(None, 950);
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
+            .context("找不到可用于事务测试的快捷键")?;
+        let conflict = replace_feature_shortcuts(
+            hwnd,
+            &mut registered,
+            &[(FeatureAction::Apps, free), (FeatureAction::Files, blocked)],
+            None,
+        );
+        check.send(free)?;
+        let (old_preserved, staged_released) = reported.recv()?;
+        worker.join().map_err(|_| anyhow::anyhow!("测试线程退出"))?;
+        assert!(conflict.is_err());
+        assert_eq!(registered, swapped);
+        assert!(
+            old_preserved,
+            "failed transaction released an existing feature key"
+        );
+        assert!(
+            staged_released,
+            "failed transaction leaked a newly staged feature key"
+        );
+        replace_feature_shortcuts(hwnd, &mut registered, &[], None)?;
+        assert!(registered.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn conflicting_change_keeps_previous_shortcut_registered() -> Result<()> {

@@ -11,6 +11,10 @@ use gpui::{
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag};
 use std::ops::Range;
 
+#[cfg(all(test, windows))]
+#[path = "markdown_native_qa.rs"]
+mod native_qa;
+
 pub(crate) struct MarkdownStyle {
     pub font_family: SharedString,
     pub font_size: f32,
@@ -77,11 +81,12 @@ impl MarkdownDocument {
     /// Each message needs its own scope for link/code-scroll element state.
     pub(crate) fn render(&self, id: impl Into<ElementId>, style: &MarkdownStyle) -> Div {
         let mut renderer = Renderer { style, next_id: 0 };
-        div().w_full().min_w_0().child(
+        div().w_full().min_w_0().flex_shrink_0().child(
             div()
                 .id(id)
                 .w_full()
                 .min_w_0()
+                .flex_shrink_0()
                 .child(renderer.blocks(&self.nodes)),
         )
     }
@@ -289,6 +294,7 @@ impl Renderer<'_> {
         let mut result = div()
             .w_full()
             .min_w_0()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(self.style.line_height * 0.4));
@@ -322,13 +328,18 @@ impl Renderer<'_> {
         let container = div()
             .w_full()
             .min_w_0()
+            .flex_shrink_0()
             .text_size(px(self.style.font_size * scale))
             .line_height(px(self.style.line_height * scale))
             .text_color(rgb(self.style.text_color));
         if content.text.is_empty() {
             return container;
         }
+        #[cfg(all(test, windows))]
+        let probe_source = content.text.clone();
         let text = StyledText::new(content.text).with_runs(content.runs);
+        #[cfg(all(test, windows))]
+        let container = native_qa::observe_text(container, probe_source, text.layout().clone());
         if content.links.is_empty() {
             container.child(text)
         } else {
@@ -466,6 +477,7 @@ impl Renderer<'_> {
         let mut list = div()
             .w_full()
             .min_w_0()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(self.style.line_height * 0.25));
@@ -486,31 +498,40 @@ impl Renderer<'_> {
                 continue;
             }
             let item_id = self.id();
-            list = list.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_start()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .min_w(px(self.style.font_size * 1.4))
-                            .flex_shrink_0()
-                            .text_align(TextAlign::Right)
-                            .text_size(px(self.style.font_size))
-                            .line_height(px(self.style.line_height))
-                            .text_color(rgb(self.style.muted_color))
-                            .child(marker),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .debug_selector(move || format!("md-list-content-{item_id}"))
-                            .child(self.blocks(content)),
-                    ),
-            );
+            // Hanging indentation keeps text in normal block flow. A zero-basis
+            // flex child can be measured at min-content width and retain a
+            // one-character wrapping width during later native text layout.
+            let marker_width =
+                self.style.font_size * (marker.chars().count() as f32 * 0.65).max(1.4);
+            let row = div()
+                .w_full()
+                .min_w_0()
+                .flex_shrink_0()
+                .relative()
+                .pl(px(marker_width + 8.))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .w(px(marker_width))
+                        .text_align(TextAlign::Right)
+                        .whitespace_nowrap()
+                        .text_size(px(self.style.font_size))
+                        .line_height(px(self.style.line_height))
+                        .text_color(rgb(self.style.muted_color))
+                        .child(marker),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .debug_selector(move || format!("md-list-content-{item_id}"))
+                        .child(self.blocks(content)),
+                );
+            #[cfg(all(test, windows))]
+            let row = native_qa::observe_children(row, "list-row");
+            list = list.child(row);
         }
         list
     }
@@ -518,6 +539,7 @@ impl Renderer<'_> {
     fn table(&mut self, aligns: &[Alignment], children: &[Node]) -> Div {
         let mut rows = div()
             .w_full()
+            .flex_shrink_0()
             .min_w(px((aligns.len().max(1) as f32 * 120.).max(240.)))
             .flex()
             .flex_col()
@@ -529,6 +551,7 @@ impl Renderer<'_> {
                 let header = matches!(tag, Tag::TableHead);
                 let mut row = div()
                     .w_full()
+                    .flex_shrink_0()
                     .flex()
                     .border_b_1()
                     .border_color(rgba(self.style.rule_color));
@@ -541,8 +564,10 @@ impl Renderer<'_> {
                     };
                     row = row.child(
                         div()
-                            .flex_1()
+                            .w(gpui::relative(1. / aligns.len().max(1) as f32))
+                            .flex_shrink_0()
                             .min_w_0()
+                            .debug_selector(move || format!("md-table-cell-{i}"))
                             .px(px(10.))
                             .py(px(7.))
                             .text_align(match aligns.get(i) {
@@ -803,6 +828,22 @@ mod layout_tests {
                 second.bottom() <= following.top() + px(1.),
                 "list overlaps following paragraph: {second:?} {following:?}"
             );
+        }
+    }
+    #[test]
+    fn markdown_table_columns_have_stable_width_without_overlapping() {
+        for width in [420., 760., 1100.] {
+            let mut app = TestAppContext::single();
+            let (_,cx)=app.add_window_view(|_,_|Fixture{width,document:MarkdownDocument::parse("| 网卡 | IPv4 DNS | 说明 |\n| --- | --- | --- |\n| Wi-Fi | `192.168.1.1` | 本机的网络配置 |\n\n后续段落。")});
+            cx.update(|window, cx: &mut App| {
+                let _ = window.draw(cx);
+            });
+            let a = cx.debug_bounds("md-table-cell-0").unwrap();
+            let b = cx.debug_bounds("md-table-cell-1").unwrap();
+            let c = cx.debug_bounds("md-table-cell-2").unwrap();
+            assert!(a.size.width > px(100.) && b.size.width > px(100.) && c.size.width > px(100.));
+            assert!(a.right() <= b.left() + px(1.) && b.right() <= c.left() + px(1.));
+            assert!(a.bottom() <= cx.debug_bounds("md-paragraph").unwrap().top() + px(1.));
         }
     }
 }
