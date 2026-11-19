@@ -6,6 +6,7 @@ use crate::plugins::{PluginResult, Plugins};
 use moin::search::everything;
 
 pub(crate) mod appearance;
+mod capture;
 mod chat;
 #[cfg(windows)]
 pub(crate) mod icons;
@@ -14,8 +15,18 @@ pub(crate) mod launcher_window;
 pub(crate) mod platform;
 mod preview;
 pub(crate) mod settings;
+pub(crate) mod ui;
 use anyhow::Result;
 use gpui::{prelude::*, *};
+use gpui_kit::component::{
+    IconName, Sizable,
+    button::{Button, ButtonVariants},
+    kbd::Kbd,
+    label::Label,
+    list::ListItem,
+    spinner::Spinner,
+    tag::Tag,
+};
 use moin::{
     config::{AppearanceConfig, Config, RecentApp},
     search::index::{self, Hit, HitKind, IndexSummary, SearchMode},
@@ -25,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use ui::UiWindow;
 
 const INK: u32 = 0xffffff;
 const MUTED: u32 = 0xd2d2d2;
@@ -32,11 +44,32 @@ const LINE: u32 = 0xffffff18;
 const LIME: u32 = 0xdaf48a;
 const HOME_APPS: usize = 5;
 
+/// Parse dynamically built shortcut strings; `Keystroke::parse` only accepts `'static` input.
+pub(crate) fn parse_keystroke(
+    source: &str,
+) -> std::result::Result<Keystroke, InvalidKeystrokeError> {
+    Keystroke::parse_with_os(source, host_os())
+}
+
+fn host_os() -> OperatingSystem {
+    if cfg!(target_os = "macos") {
+        OperatingSystem::Mac
+    } else if cfg!(target_os = "windows") {
+        OperatingSystem::Windows
+    } else if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Unknown
+    }
+}
+
 #[derive(Clone)]
 enum Command {
     Scope(SearchMode),
     Ai,
     Plugin(String, String),
+    Capture(capture::CaptureKind),
+    Settings,
 }
 
 #[derive(Clone, Copy)]
@@ -115,11 +148,12 @@ pub struct Moin {
     ai: chat::AiChat,
     input: Entity<SearchInput>,
     mode: SearchMode,
+    plugin_scope: Option<String>,
     hits: Vec<Hit>,
     selected: usize,
     summary: Option<IndexSummary>,
     indexing: bool,
-    settings_window: Option<WindowHandle<settings::Settings>>,
+    settings_window: Option<UiWindow<settings::Settings>>,
     preview_open: bool,
     file_preview: Option<preview::FilePreview>,
     preview_key: Option<(PathBuf, Option<usize>)>,
@@ -162,20 +196,29 @@ impl Moin {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(SearchInput::new);
-        input.read(cx).focus(window, cx);
-        let subscription = cx.subscribe(&input, |view: &mut Self, _, _: &Changed, cx| {
-            view.refresh(cx);
-        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |view: &mut Self, _, _: &Changed, window, cx| {
+                view.input_changed(window, cx);
+            },
+        );
         let commands = [SearchMode::Apps, SearchMode::Files, SearchMode::Text]
             .into_iter()
             .map(Command::Scope)
             .chain(std::iter::once(Command::Ai))
+            .chain([
+                Command::Capture(capture::CaptureKind::Screenshot),
+                Command::Capture(capture::CaptureKind::Gif),
+            ])
             .chain(
                 plugins
                     .commands()
                     .into_iter()
                     .map(|(prefix, description)| Command::Plugin(prefix, description)),
             )
+            .chain(std::iter::once(Command::Settings))
             .collect();
         let ai_config = config.ai.clone();
         let ai_error = None;
@@ -197,6 +240,7 @@ impl Moin {
             ai,
             input,
             mode: SearchMode::All,
+            plugin_scope: None,
             hits: Vec::new(),
             selected: 0,
             summary: None,
@@ -240,7 +284,62 @@ impl Moin {
     }
 
     fn query(&self, cx: &App) -> String {
-        self.input.read(cx).value().trim().to_owned()
+        let value = self.input.read(cx).value().trim();
+        match &self.plugin_scope {
+            Some(prefix) => format!("{prefix} {value}"),
+            None => value.to_owned(),
+        }
+    }
+
+    fn is_plugin_query(&self, cx: &App) -> bool {
+        self.mode == SearchMode::All
+            && (self.plugin_scope.is_some() || self.plugins.recognizes(&self.query(cx)))
+    }
+
+    fn input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai.active || self.input.read(cx).is_composing() {
+            return;
+        }
+        if self.mode == SearchMode::All && self.plugin_scope.is_none() {
+            let value = self.input.read(cx).value().to_owned();
+            if let Some((entry, query)) = parse_entry(&value) {
+                match entry {
+                    PaletteEntry::Scope(mode) => {
+                        self.set_mode(mode, window, cx);
+                        self.input
+                            .update(cx, |input, cx| input.set_value(query, cx));
+                        self.refresh(cx);
+                    }
+                    PaletteEntry::Plugin(prefix) => {
+                        self.tool(prefix, window, cx);
+                        self.input
+                            .update(cx, |input, cx| input.set_value(query, cx));
+                        self.refresh(cx);
+                    }
+                    PaletteEntry::Ai => {
+                        self.enter_ai(window, cx);
+                    }
+                    PaletteEntry::Capture(kind) => self.start_capture(kind, window, cx),
+                    PaletteEntry::Settings => {
+                        self.input.update(cx, |input, cx| input.clear(cx));
+                        self.open_settings(window, cx);
+                    }
+                }
+                return;
+            }
+            // Executable and Extism commands use the same argument-only pages.
+            if self.plugins.recognizes(value.trim()) {
+                let (prefix, arguments) = value
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((value.trim(), ""));
+                self.tool(prefix, window, cx);
+                self.input.update(cx, |input, cx| {
+                    input.set_value(arguments.trim_start().to_owned(), cx)
+                });
+            }
+        }
+        self.refresh(cx);
     }
 
     fn composing(&self, cx: &App) -> bool {
@@ -295,14 +394,6 @@ impl Moin {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.mode == SearchMode::All {
-            if let Some((mode, query)) = parse_scope_prefix(self.input.read(cx).value()) {
-                self.mode = mode;
-                self.input
-                    .update(cx, |input, cx| input.set_value(query, cx));
-                return;
-            }
-        }
         self.search_task.take();
         self.searching = false;
         self.plugin_busy = false;
@@ -316,7 +407,7 @@ impl Moin {
         self.hits.clear();
         self.scroll.set_offset(point(px(0.), px(0.)));
         let query = self.query(cx);
-        if self.plugins.recognizes(&query) || self.indexing && !self.db.exists() {
+        if self.is_plugin_query(cx) || self.indexing && !self.db.exists() {
             cx.notify();
             return;
         }
@@ -382,12 +473,16 @@ impl Moin {
 
     fn set_mode(&mut self, mode: SearchMode, window: &mut Window, cx: &mut Context<Self>) {
         self.ai.active = false;
+        let plugin_query =
+            self.plugin_scope.take().is_some() || self.plugins.recognizes(&self.query(cx));
         self.mode = mode;
-        let plugin_query = self.plugins.recognizes(&self.query(cx));
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(mode_placeholder(mode), cx);
+        });
         if plugin_query {
             self.input.update(cx, |input, cx| input.clear(cx));
         }
-        self.input.read(cx).focus(window, cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
         self.refresh(cx);
     }
 
@@ -464,6 +559,19 @@ impl Moin {
         }
     }
 
+    pub fn save_capture_config(
+        &mut self,
+        capture: moin::config::CaptureConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let mut config = self.config.clone();
+        config.capture = capture.validated()?;
+        config.save(&self.home)?;
+        self.config = config;
+        cx.notify();
+        Ok(())
+    }
+
     pub fn settings_snapshot(&self) -> settings::Snapshot {
         settings::Snapshot {
             roots: self.config.roots.clone(),
@@ -495,6 +603,8 @@ impl Moin {
             ai_error: self.ai_error.clone(),
             ai_notice: self.ai_notice.clone(),
             appearance: self.config.appearance.clone(),
+            capture: self.config.capture.clone(),
+            capture_error: None,
             everything_enabled: self.config.everything.enabled,
             everything_status: self.everything_status.clone(),
             everything_error: self.everything_error.clone(),
@@ -693,7 +803,15 @@ impl Moin {
                 self.input.update(cx, |input, cx| input.clear(cx));
                 self.set_mode(mode, window, cx);
             }
-            FeatureAction::Ai => self.set_ai(true, window, cx),
+            FeatureAction::Ai => self.enter_ai(window, cx),
+            FeatureAction::Screenshot => {
+                self.start_capture(capture::CaptureKind::Screenshot, window, cx);
+                return;
+            }
+            FeatureAction::GifRecording => {
+                self.start_capture(capture::CaptureKind::Gif, window, cx);
+                return;
+            }
             FeatureAction::Settings => {
                 self.open_settings(window, cx);
                 return;
@@ -801,7 +919,9 @@ impl Moin {
     }
 
     fn showing_commands(&self, cx: &App) -> bool {
-        self.mode == SearchMode::All && self.input.read(cx).value().trim().is_empty()
+        self.mode == SearchMode::All
+            && self.plugin_scope.is_none()
+            && self.input.read(cx).value().trim().is_empty()
     }
 
     fn clear_file_preview(&mut self) {
@@ -914,9 +1034,11 @@ impl Moin {
         }
         if self.mode != SearchMode::All {
             self.set_mode(SearchMode::All, window, cx);
-        } else if self.plugins.recognizes(&self.query(cx)) {
-            self.input.update(cx, |input, cx| input.clear(cx));
+        } else if self.plugin_scope.is_some() || self.plugins.recognizes(&self.query(cx)) {
+            self.set_mode(SearchMode::All, window, cx);
         }
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.refresh(cx);
     }
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1003,7 +1125,7 @@ impl Moin {
             return;
         }
         let query = self.query(cx);
-        if self.plugins.recognizes(&query) {
+        if self.is_plugin_query(cx) {
             self.result = None;
             self.error = None;
             self.notice = None;
@@ -1090,11 +1212,42 @@ impl Moin {
     }
 
     fn tool(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai.active = false;
+        self.mode = SearchMode::All;
+        self.plugin_scope = Some(command.to_owned());
         self.input.update(cx, |input, cx| {
-            input.set_value(format!("{command} "), cx);
+            input.set_placeholder(plugin_placeholder(command), cx);
+            input.clear(cx);
         });
-        self.input.read(cx).focus(window, cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
         self.refresh(cx);
+    }
+
+    fn start_capture(
+        &mut self,
+        kind: capture::CaptureKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai.active = false;
+        self.actions_open = false;
+        self.plugin_scope = None;
+        self.mode = SearchMode::All;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(mode_placeholder(SearchMode::All), cx);
+            input.clear(cx);
+        });
+        self.refresh(cx);
+        if let Err(error) = capture::launch(kind, self.config.capture.clone(), window, cx) {
+            self.error = Some(format!("无法打开截屏工具 · {error:#}"));
+            cx.notify();
+        }
+    }
+
+    fn enter_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(SearchMode::All, window, cx);
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.set_ai(true, window, cx);
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1122,29 +1275,16 @@ impl Moin {
             cx.notify();
             return;
         }
-        let query = self.query(cx);
-        if !query.is_empty() {
-            let replacement = if self.plugins.recognizes(&query) {
-                let prefix = if query.starts_with('=') {
-                    "="
-                } else {
-                    query.split_whitespace().next().unwrap_or_default()
-                };
-                if query == prefix {
-                    String::new()
-                } else {
-                    format!("{prefix} ")
-                }
-            } else {
-                String::new()
-            };
-            self.input
-                .update(cx, |input, cx| input.set_value(replacement, cx));
-            self.input.read(cx).focus(window, cx);
+        if self.mode != SearchMode::All
+            || self.plugin_scope.is_some()
+            || self.plugins.recognizes(&self.query(cx))
+        {
+            self.return_to_parent(window, cx);
             return;
         }
-        if self.mode != SearchMode::All {
-            self.set_mode(SearchMode::All, window, cx);
+        if !self.query(cx).is_empty() {
+            self.input.update(cx, |input, cx| input.clear(cx));
+            self.input.update(cx, |input, cx| input.focus(window, cx));
             return;
         }
         if !self.composing(cx) && !self.folder_picker_open {
@@ -1157,7 +1297,7 @@ impl Moin {
         cx: &App,
     ) -> Vec<(ResultAction, &'static str, &'static str, &'static str)> {
         let mut actions = Vec::new();
-        if self.plugins.recognizes(&self.query(cx)) {
+        if self.is_plugin_query(cx) {
             actions.push((ResultAction::Run, "运行命令", "\u{e768}", "Enter"));
             if self.result.is_some() {
                 actions.push((ResultAction::Copy, "复制结果", "\u{e8c8}", "Ctrl+Shift+C"));
@@ -1191,7 +1331,7 @@ impl Moin {
         }
         self.actions_open = !self.actions_open;
         self.selected_action = 0;
-        self.input.read(cx).focus(window, cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -1246,18 +1386,23 @@ impl Moin {
             )
             .children(self.result_actions(cx).into_iter().enumerate().map(
                 |(i, (action, label, icon, key))| {
-                    row()
-                        .id(("result-action", i))
+                    ListItem::new(("result-action", i))
                         .h(rem(40.))
                         .px_3()
-                        .gap_3()
                         .rounded(px(4.))
-                        .when(i == self.selected_action, |row| row.bg(rgba(0xffffff12)))
-                        .hover(|style| style.bg(rgba(0xffffff1a)))
-                        .cursor_pointer()
-                        .child(glyph(icon, 14., INK))
-                        .child(div().flex_1().text_size(rem(14.)).child(label))
-                        .when(!key.is_empty(), |row| row.child(keycap(key)))
+                        .selected(i == self.selected_action)
+                        .child(
+                            row()
+                                .gap_3()
+                                .text_color(rgb(INK))
+                                .child(glyph(icon, 14., INK))
+                                .child(
+                                    Label::new(label)
+                                        .id(("result-action-label", i))
+                                        .text_size(rem(14.)),
+                                ),
+                        )
+                        .when(!key.is_empty(), |row| row.suffix(move |_, _| keycap(key)))
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.perform_action(action, window, cx)
                         }))
@@ -1268,8 +1413,10 @@ impl Moin {
     fn execute_command(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.commands.get(index).cloned() {
             Some(Command::Scope(mode)) => self.set_mode(mode, window, cx),
-            Some(Command::Ai) => self.set_ai(true, window, cx),
+            Some(Command::Ai) => self.enter_ai(window, cx),
             Some(Command::Plugin(prefix, _)) => self.tool(&prefix, window, cx),
+            Some(Command::Capture(kind)) => self.start_capture(kind, window, cx),
+            Some(Command::Settings) => self.open_settings(window, cx),
             None => {}
         }
     }
@@ -1291,7 +1438,7 @@ impl Moin {
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.actions_open = false;
-        let Some(launcher) = window.window_handle().downcast::<Self>() else {
+        let Some(launcher) = UiWindow::from_window(window) else {
             return;
         };
         let settings_window = self.settings_window;
@@ -1320,6 +1467,10 @@ impl Moin {
 
     fn header(&self, cx: &mut Context<Self>) -> Div {
         let has_query = !self.input.read(cx).value().is_empty();
+        let scope = self.plugin_scope.as_ref().map_or_else(
+            || (self.mode != SearchMode::All).then(|| mode_label(self.mode).to_owned()),
+            |prefix| Some(plugin_label(prefix).to_owned()),
+        );
         row()
             .h(rem(72.))
             .flex_shrink_0()
@@ -1336,12 +1487,12 @@ impl Moin {
                     .min_w_0()
                     .child(self.input.clone()),
             )
-            .when(self.mode != SearchMode::All, |header| {
+            .when_some(scope, |header, scope| {
                 header.child(
-                    control("scope", mode_label(self.mode))
-                        .child(keycap("×"))
+                    control("scope", scope)
+                        .child(keycap("Esc"))
                         .on_click(cx.listener(|view, _, window, cx| {
-                            view.set_mode(SearchMode::All, window, cx);
+                            view.return_to_parent(window, cx);
                         })),
                 )
             })
@@ -1349,7 +1500,7 @@ impl Moin {
                 header.child(
                     control("clear", "×").on_click(cx.listener(|view, _, window, cx| {
                         view.input.update(cx, |input, cx| input.clear(cx));
-                        view.input.read(cx).focus(window, cx);
+                        view.input.update(cx, |input, cx| input.focus(window, cx));
                     })),
                 )
             })
@@ -1359,7 +1510,7 @@ impl Moin {
                         self.configured_command_key(&Command::Ai)
                             .unwrap_or("Ctrl+5".into()),
                     ))
-                    .on_click(cx.listener(|view, _, window, cx| view.set_ai(true, window, cx))),
+                    .on_click(cx.listener(|view, _, window, cx| view.enter_ai(window, cx))),
             )
     }
 
@@ -1371,6 +1522,9 @@ impl Moin {
             Command::Scope(SearchMode::Text) => FeatureAction::Text,
             Command::Scope(SearchMode::All) => FeatureAction::All,
             Command::Ai => FeatureAction::Ai,
+            Command::Capture(capture::CaptureKind::Screenshot) => FeatureAction::Screenshot,
+            Command::Capture(capture::CaptureKind::Gif) => FeatureAction::GifRecording,
+            Command::Settings => FeatureAction::Settings,
             Command::Plugin(prefix, _) => match prefix.as_str() {
                 "=" => FeatureAction::Calculator,
                 "翻译" => FeatureAction::Translation,
@@ -1441,7 +1595,7 @@ impl Moin {
                 let active = self.selected == i;
                 list = list.child(
                     entry(("hit", i), symbol, hit.title.clone(), detail, active)
-                        .when(!home, |entry| entry.child(kind_label(label)))
+                        .when(!home, |entry| entry.suffix(move |_, _| kind_label(label)))
                         .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                             view.select_result(i, cx);
                             if view.hits.get(i).is_some_and(|hit| hit.kind == HitKind::App)
@@ -1449,7 +1603,7 @@ impl Moin {
                             {
                                 view.open_selected(window, cx);
                             }
-                            view.input.read(cx).focus(window, cx);
+                            view.input.update(cx, |input, cx| input.focus(window, cx));
                         })),
                 );
             }
@@ -1463,29 +1617,46 @@ impl Moin {
                         String::new(),
                         "\u{e71d}",
                         0xa8cff5,
-                        Some("Ctrl+2"),
+                        Some("a"),
                     ),
                     Command::Scope(SearchMode::Files) => (
                         "搜索文件".into(),
                         String::new(),
                         "\u{e8b7}",
                         0xffcd8a,
-                        Some("Ctrl+3"),
+                        Some("f"),
                     ),
                     Command::Scope(_) => (
                         "搜索正文".into(),
                         String::new(),
                         "\u{e8a5}",
                         0xc8dffc,
-                        Some("Ctrl+4"),
+                        Some("t"),
                     ),
                     Command::Ai => (
                         "与 Moin 对话".into(),
                         "AI 助手".into(),
                         "\u{e8f2}",
                         LIME,
-                        Some("Ctrl+5"),
+                        Some("i"),
                     ),
+                    Command::Capture(capture::CaptureKind::Screenshot) => (
+                        "截图".into(),
+                        "框选屏幕区域".into(),
+                        "\u{e722}",
+                        0x9bd4ff,
+                        Some("s"),
+                    ),
+                    Command::Capture(capture::CaptureKind::Gif) => (
+                        "录制 GIF".into(),
+                        "框选区域，录制为 GIF 动图".into(),
+                        "\u{e714}",
+                        0xffcd8a,
+                        Some("g"),
+                    ),
+                    Command::Settings => {
+                        ("设置".into(), String::new(), "\u{e713}", MUTED, Some("o"))
+                    }
                     Command::Plugin(prefix, description) => {
                         let (title, explanation) =
                             description.split_once(" · ").unwrap_or((description, ""));
@@ -1496,12 +1667,16 @@ impl Moin {
                             "换算" => ("\u{ed5e}", 0xffd18f),
                             _ => ("\u{e74c}", 0xafe0ec),
                         };
-                        (title.to_owned(), explanation.to_owned(), glyph, color, None)
+                        (
+                            title.to_owned(),
+                            explanation.to_owned(),
+                            glyph,
+                            color,
+                            plugin_entry_key(prefix),
+                        )
                     }
                 };
-                let key = self
-                    .configured_command_key(command)
-                    .or_else(|| key.map(str::to_owned));
+                let configured_key = self.configured_command_key(command);
                 list = list.child(
                     entry(
                         ("command", i),
@@ -1510,7 +1685,12 @@ impl Moin {
                         detail,
                         self.selected == self.hits.len() + i,
                     )
-                    .when_some(key, |entry, key| entry.child(keycap(key)))
+                    .suffix(move |_, _| {
+                        row()
+                            .gap_2()
+                            .when_some(key, |row, key| row.child(keycap(key)))
+                            .when_some(configured_key.clone(), |row, key| row.child(keycap(key)))
+                    })
                     .on_click(cx.listener(move |view, _, window, cx| {
                         view.execute_command(i, window, cx);
                     })),
@@ -1590,7 +1770,9 @@ impl Moin {
         );
         if self.preview_loading {
             return pane.child(
-                div()
+                row()
+                    .gap_2()
+                    .child(Spinner::new().small().color(rgb(MUTED).into()))
                     .text_size(rem(14.))
                     .text_color(rgb(MUTED))
                     .child("正在读取预览…"),
@@ -1808,9 +1990,19 @@ impl Moin {
                         .px_4()
                         .child(control("plugin-example", example).on_click(cx.listener(
                             move |view, _, window, cx| {
+                                let value = view.plugin_scope.as_ref().map_or_else(
+                                    || example.to_owned(),
+                                    |prefix| {
+                                        example
+                                            .strip_prefix(prefix)
+                                            .unwrap_or(example)
+                                            .trim_start()
+                                            .to_owned()
+                                    },
+                                );
                                 view.input
-                                    .update(cx, |input, cx| input.set_value(example.into(), cx));
-                                view.input.read(cx).focus(window, cx);
+                                    .update(cx, |input, cx| input.set_value(value, cx));
+                                view.input.update(cx, |input, cx| input.focus(window, cx));
                             },
                         ))),
                 )
@@ -1826,7 +2018,15 @@ impl Moin {
             .as_ref()
             .or(self.notice.as_ref())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if self.mode != SearchMode::All || self.plugin_scope.is_some() {
+                    "Esc 返回全局搜索".into()
+                } else if self.showing_commands(cx) {
+                    "键入入口键进入功能".into()
+                } else {
+                    String::new()
+                }
+            });
         row()
             .h(rem(48.))
             .flex_shrink_0()
@@ -1837,8 +2037,7 @@ impl Moin {
             .bg(rgba(0x00000022))
             .child(
                 control("settings", "设置")
-                    .child(glyph("\u{e713}", 18., INK))
-                    .flex_row_reverse()
+                    .icon(IconName::Settings)
                     .on_click(cx.listener(|view, _, window, cx| view.open_settings(window, cx))),
             )
             .child(
@@ -1889,7 +2088,7 @@ impl Render for Moin {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.config.appearance.ui_font_size));
         let query = self.query(cx);
-        let plugin = self.plugins.recognizes(&query);
+        let plugin = self.is_plugin_query(cx);
         let body = if self.ai.active {
             self.ai.pane.clone().into_any_element()
         } else if plugin {
@@ -1899,102 +2098,175 @@ impl Render for Moin {
         } else {
             self.search_results(&query, window, cx).into_any_element()
         };
-        div()
-            .key_context("Moin")
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                view.palette_key(event, window, cx)
-            }))
-            .on_action(cx.listener(|view, _: &input::Backspace, window, cx| {
-                if !view.ai.active && view.query(cx).is_empty() {
-                    view.return_to_parent(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|view, _: &Next, _, cx| view.move_selection(1, cx)))
-            .on_action(cx.listener(|view, _: &Previous, _, cx| view.move_selection(-1, cx)))
-            .on_action(cx.listener(|view, _: &Confirm, window, cx| view.confirm(window, cx)))
-            .on_action(cx.listener(|view, _: &Dismiss, window, cx| view.dismiss(window, cx)))
-            .on_action(cx.listener(|view, _: &Copy, _, cx| view.copy(cx)))
-            .on_action(cx.listener(|view, _: &Preview, _, cx| view.toggle_preview(cx)))
-            .on_action(
-                cx.listener(|view, _: &MoreActions, window, cx| view.toggle_actions(window, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &OpenSettings, window, cx| view.open_settings(window, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &FocusSearch, window, cx| view.focus_input(window, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &Ai, window, cx| view.set_ai(!view.ai.active, window, cx)),
-            )
-            .on_action(cx.listener(|view, _: &NewChat, window, cx| {
-                if view.ai.active {
-                    view.new_ai_chat(window, cx);
-                }
-            }))
-            .on_action(
-                cx.listener(|view, _: &All, window, cx| view.set_mode(SearchMode::All, window, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &Apps, window, cx| {
+        let content =
+            div()
+                .key_context("Moin")
+                .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                    view.palette_key(event, window, cx)
+                }))
+                .on_action(cx.listener(|view, _: &input::Backspace, window, cx| {
+                    if !view.ai.active && view.query(cx).is_empty() {
+                        view.return_to_parent(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|view, _: &Next, _, cx| view.move_selection(1, cx)))
+                .on_action(cx.listener(|view, _: &Previous, _, cx| view.move_selection(-1, cx)))
+                .on_action(cx.listener(|view, _: &Confirm, window, cx| view.confirm(window, cx)))
+                .on_action(cx.listener(|view, _: &Dismiss, window, cx| view.dismiss(window, cx)))
+                .on_action(cx.listener(|view, _: &Copy, _, cx| view.copy(cx)))
+                .on_action(cx.listener(|view, _: &Preview, _, cx| view.toggle_preview(cx)))
+                .on_action(
+                    cx.listener(|view, _: &MoreActions, window, cx| {
+                        view.toggle_actions(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|view, _: &OpenSettings, window, cx| {
+                        view.open_settings(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|view, _: &FocusSearch, window, cx| view.focus_input(window, cx)),
+                )
+                .on_action(cx.listener(|view, _: &Ai, window, cx| {
+                    if view.ai.active {
+                        view.set_ai(false, window, cx);
+                    } else {
+                        view.enter_ai(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|view, _: &NewChat, window, cx| {
+                    if view.ai.active {
+                        view.new_ai_chat(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|view, _: &All, window, cx| {
+                    view.set_mode(SearchMode::All, window, cx)
+                }))
+                .on_action(cx.listener(|view, _: &Apps, window, cx| {
                     view.set_mode(SearchMode::Apps, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|view, _: &Files, window, cx| {
-                view.set_mode(SearchMode::Files, window, cx)
-            }))
-            .on_action(
-                cx.listener(|view, _: &Text, window, cx| {
+                }))
+                .on_action(cx.listener(|view, _: &Files, window, cx| {
+                    view.set_mode(SearchMode::Files, window, cx)
+                }))
+                .on_action(cx.listener(|view, _: &Text, window, cx| {
                     view.set_mode(SearchMode::Text, window, cx)
-                }),
-            )
-            .size_full()
-            .relative()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(rgba(0xffffff2e))
-            .bg(rgba(0x202020a8))
-            .text_color(rgb(INK))
-            .font_family(appearance::resolve_family(
-                &self.config.appearance.ui_font_family,
-            ))
-            .text_size(rem(16.))
-            .flex()
-            .flex_col()
-            .when(!self.ai.active, |root| root.child(self.header(cx)))
-            .child(body)
-            .when(!self.ai.active, |root| root.child(self.footer(plugin, cx)))
-            .when(self.actions_open, |root| {
-                root.child(
-                    div()
-                        .id("actions-dismiss")
-                        .absolute()
-                        .inset_0()
-                        .on_click(cx.listener(|view, _, _, cx| {
+                }))
+                .size_full()
+                .relative()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgba(0xffffff2e))
+                .bg(rgba(0x202020a8))
+                .text_color(rgb(INK))
+                .font_family(appearance::resolve_family(
+                    &self.config.appearance.ui_font_family,
+                ))
+                .text_size(rem(16.))
+                .flex()
+                .flex_col()
+                .when(!self.ai.active, |root| root.child(self.header(cx)))
+                .child(body)
+                .when(!self.ai.active, |root| root.child(self.footer(plugin, cx)))
+                .when(self.actions_open, |root| {
+                    root.child(div().id("actions-dismiss").absolute().inset_0().on_click(
+                        cx.listener(|view, _, _, cx| {
                             view.actions_open = false;
                             cx.notify();
-                        })),
-                )
-                .child(self.actions_menu(cx))
-            })
+                        }),
+                    ))
+                    .child(self.actions_menu(cx))
+                });
+        ui::dark(content, cx)
     }
 }
 
 fn row() -> Div {
-    div().flex().items_center()
+    gpui_kit::component::h_flex()
 }
 
-/// Command Palette aliases enter a search page only once the delimiter is typed.
-fn parse_scope_prefix(value: &str) -> Option<(SearchMode, String)> {
+#[derive(Clone, Copy)]
+enum PaletteEntry {
+    Scope(SearchMode),
+    Ai,
+    Plugin(&'static str),
+    Capture(capture::CaptureKind),
+    Settings,
+}
+
+/// Entry keys are consumed only on the global page, after IME composition.
+/// Pasting a complete `f query` or a legacy prefix keeps the query intact.
+fn parse_entry(value: &str) -> Option<(PaletteEntry, String)> {
     let value = value.trim_start();
-    let end = value.find(char::is_whitespace)?;
-    let mode = match value[..end].to_ascii_lowercase().as_str() {
-        "file" | "files" | "文件" => SearchMode::Files,
-        "app" | "apps" | "应用" => SearchMode::Apps,
-        "text" | "正文" => SearchMode::Text,
+    if let Some(expression) = value.strip_prefix('=') {
+        return Some((
+            PaletteEntry::Plugin("="),
+            expression.trim_start().to_owned(),
+        ));
+    }
+    let end = value.find(char::is_whitespace).unwrap_or(value.len());
+    let key = value[..end].to_ascii_lowercase();
+    let arguments = value[end..].trim_start();
+    let entry = match key.as_str() {
+        "a" => PaletteEntry::Scope(SearchMode::Apps),
+        "f" => PaletteEntry::Scope(SearchMode::Files),
+        "t" => PaletteEntry::Scope(SearchMode::Text),
+        "i" | "ai" if arguments.is_empty() => PaletteEntry::Ai,
+        "c" | "calc" => PaletteEntry::Plugin("="),
+        "r" | "tr" | "翻译" => PaletteEntry::Plugin("翻译"),
+        "d" | "dict" | "词典" => PaletteEntry::Plugin("词典"),
+        "u" | "convert" | "换算" => PaletteEntry::Plugin("换算"),
+        "s" if arguments.is_empty() => PaletteEntry::Capture(capture::CaptureKind::Screenshot),
+        "g" if arguments.is_empty() => PaletteEntry::Capture(capture::CaptureKind::Gif),
+        "o" if arguments.is_empty() => PaletteEntry::Settings,
+        // Long aliases keep their delimiter, so pasting file names such as
+        // `file` and `file.txt` never changes the selected page.
+        "app" | "apps" | "应用" if end < value.len() => PaletteEntry::Scope(SearchMode::Apps),
+        "file" | "files" | "文件" if end < value.len() => PaletteEntry::Scope(SearchMode::Files),
+        "text" | "正文" if end < value.len() => PaletteEntry::Scope(SearchMode::Text),
         _ => return None,
     };
-    Some((mode, value[end..].trim_start().to_owned()))
+    Some((entry, arguments.to_owned()))
+}
+
+fn mode_placeholder(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::All => "搜索应用、文件和命令…",
+        SearchMode::Apps => "输入应用名称…",
+        SearchMode::Files if cfg!(windows) => "输入文件名、路径或 Everything 查询…",
+        SearchMode::Files => "输入文件名或路径…",
+        SearchMode::Text => "输入要搜索的文件正文…",
+    }
+}
+
+fn plugin_placeholder(command: &str) -> &'static str {
+    match command {
+        "=" => "输入表达式，例如 (18 + 6) / 3…",
+        "tr" | "翻译" => "输入要翻译的文本…",
+        "dict" | "词典" => "输入要查询的单词…",
+        "convert" | "换算" => "输入数值和单位，例如 12 km mi…",
+        _ => "输入插件参数，Enter 运行…",
+    }
+}
+
+fn plugin_label(command: &str) -> &str {
+    match command {
+        "=" => "计算器",
+        "tr" | "翻译" => "翻译",
+        "dict" | "词典" => "词典",
+        "convert" | "换算" => "单位换算",
+        _ => command,
+    }
+}
+
+fn plugin_entry_key(command: &str) -> Option<&'static str> {
+    match command {
+        "=" => Some("c"),
+        "翻译" => Some("r"),
+        "词典" => Some("d"),
+        "换算" => Some("u"),
+        _ => None,
+    }
 }
 
 fn result_number(key: &str) -> Option<usize> {
@@ -2082,23 +2354,27 @@ fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn section_label(label: &'static str) -> Div {
-    div()
+fn section_label(label: &'static str) -> Label {
+    Label::new(label)
+        .id((ElementId::from("section-label"), SharedString::new_static(label)))
         .px(px(16.))
         .h(rem(28.))
         .flex()
         .items_center()
         .text_size(rem(12.))
         .text_color(rgb(MUTED))
-        .child(label)
 }
 
-fn kind_label(label: &'static str) -> Div {
-    div()
+fn kind_label(label: &'static str) -> Tag {
+    Tag::custom(rgba(0).into(), rgb(MUTED).into(), rgba(0).into())
+        .small()
         .px_2()
         .text_size(rem(12.))
         .text_color(rgb(MUTED))
-        .child(label)
+        .child(
+            Label::new(label)
+                .id((ElementId::from("kind-label"), SharedString::new_static(label))),
+        )
 }
 
 fn entry(
@@ -2107,42 +2383,38 @@ fn entry(
     title: String,
     detail: String,
     active: bool,
-) -> Stateful<Div> {
-    row()
-        .id(id)
+) -> ListItem {
+    ListItem::new(id)
         .h(rem(44.))
         .w_full()
         .px(px(16.))
-        .gap(px(16.))
         .rounded(px(4.))
-        .when(active, |row| row.bg(rgba(0xffffff17)))
-        .hover(move |style| style.bg(rgba(if active { 0xffffff1e } else { 0xffffff0e })))
-        .active(|style| style.bg(rgba(0xffffff1e)))
-        .cursor_pointer()
-        .child(icon)
+        .selected(active)
         .child(
-            row()
-                .flex_1()
-                .min_w_0()
-                .gap(px(15.))
-                .child(
-                    div()
-                        .when(!detail.is_empty(), |title| title.max_w(relative(0.56)))
-                        .truncate()
-                        .text_size(rem(16.))
-                        .child(title),
-                )
-                .when(!detail.is_empty(), |line| {
-                    line.child(
+            row().gap(px(16.)).text_color(rgb(INK)).child(icon).child(
+                row()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(15.))
+                    .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .when(!detail.is_empty(), |title| title.max_w(relative(0.56)))
                             .truncate()
-                            .text_size(rem(14.))
-                            .text_color(rgb(MUTED))
-                            .child(detail),
+                            .text_size(rem(16.))
+                            .child(title),
                     )
-                }),
+                    .when(!detail.is_empty(), |line| {
+                        line.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(rem(14.))
+                                .text_color(rgb(MUTED))
+                                .child(detail),
+                        )
+                    }),
+            ),
         )
 }
 
@@ -2150,47 +2422,66 @@ fn message(title: &str, detail: &str) -> Div {
     div()
         .p_4()
         .child(
-            div()
+            Label::new(title.to_owned())
+                .id((ElementId::from("message-title"), title.to_owned()))
                 .text_size(rem(18.))
-                .font_weight(FontWeight::MEDIUM)
-                .child(title.to_owned()),
+                .font_weight(FontWeight::MEDIUM),
         )
         .child(
-            div()
+            Label::new(detail.to_owned())
+                .id((ElementId::from("message-detail"), detail.to_owned()))
                 .mt_2()
                 .text_size(rem(14.))
-                .text_color(rgb(MUTED))
-                .child(detail.to_owned()),
+                .text_color(rgb(MUTED)),
         )
 }
 
-fn control(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-    row()
-        .id(id)
+fn control(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id)
+        .ghost()
+        .tab_stop(false)
+        .label(label)
         .h(rem(36.))
         .flex_shrink_0()
         .gap(px(8.))
         .px_2()
         .rounded(px(4.))
         .text_size(rem(14.))
-        .hover(|style| style.bg(rgba(0xffffff1c)))
-        .active(|style| style.bg(rgba(0xffffff32)))
+        .text_color(rgb(INK))
         .cursor_pointer()
-        .child(label.into())
 }
 
-fn keycap(key: impl AsRef<str>) -> Div {
-    div()
-        .flex_shrink_0()
-        .px(px(7.))
-        .py(px(3.))
-        .min_w(px(24.))
-        .text_align(TextAlign::Center)
-        .rounded(px(6.))
-        .bg(rgba(0xffffff0e))
-        .text_size(rem(12.))
-        .text_color(rgb(MUTED))
-        .child(appearance::shortcut_label(key.as_ref()))
+fn keycap(key: impl AsRef<str>) -> AnyElement {
+    let key = key.as_ref();
+    let mut lower = key.to_lowercase();
+    if cfg!(target_os = "macos") && (lower == "ctrl" || lower.starts_with("ctrl+")) {
+        lower = lower.replacen("ctrl", "cmd", 1);
+    }
+    let normalized = match lower.as_str() {
+        "esc" => "escape",
+        _ => &lower,
+    }
+    .replace('↵', "enter")
+    .replace('⌃', "ctrl-")
+    .replace('⌘', "cmd-")
+    .replace('⌥', "alt-")
+    .replace('+', "-");
+    if let Ok(stroke) = parse_keystroke(&normalized) {
+        Kbd::new(stroke)
+            .appearance(false)
+            .text_color(rgb(MUTED))
+            .text_size(rem(12.))
+            .into_any_element()
+    } else {
+        Tag::custom(
+            rgba(0xffffff0e).into(),
+            rgb(MUTED).into(),
+            rgba(0x00000000).into(),
+        )
+        .small()
+        .child(appearance::shortcut_label(key))
+        .into_any_element()
+    }
 }
 
 #[cfg(windows)]
@@ -2233,7 +2524,7 @@ fn open_path(path: &Path) -> Result<()> {
 
 #[cfg(any(windows, target_os = "macos"))]
 pub fn listen_to_tray(
-    handle: WindowHandle<Moin>,
+    handle: UiWindow<Moin>,
     receiver: async_channel::Receiver<platform::tray::TrayEvent>,
     cx: &mut App,
 ) {
@@ -2308,25 +2599,92 @@ pub fn listen_to_tray(
 
 #[cfg(test)]
 mod palette_tests {
-    use super::{parse_scope_prefix, result_number};
+    use super::{PaletteEntry, capture::CaptureKind, parse_entry, result_number};
     use moin::search::index::SearchMode;
+
+    fn parse_scope(value: &str) -> Option<(SearchMode, String)> {
+        let (PaletteEntry::Scope(mode), query) = parse_entry(value)? else {
+            return None;
+        };
+        Some((mode, query))
+    }
+
+    #[::core::prelude::v1::test]
+    fn entry_keys_open_scopes_without_a_delimiter() {
+        for (key, mode) in [
+            ("a", SearchMode::Apps),
+            ("f", SearchMode::Files),
+            ("t", SearchMode::Text),
+        ] {
+            assert_eq!(parse_scope(key), Some((mode, String::new())));
+            assert_eq!(
+                parse_scope(&key.to_uppercase()),
+                Some((mode, String::new()))
+            );
+        }
+        assert!(matches!(parse_entry("i"), Some((PaletteEntry::Ai, _))));
+        assert!(matches!(
+            parse_entry("s"),
+            Some((PaletteEntry::Capture(CaptureKind::Screenshot), _))
+        ));
+        assert!(matches!(
+            parse_entry("g"),
+            Some((PaletteEntry::Capture(CaptureKind::Gif), _))
+        ));
+        assert!(matches!(
+            parse_entry("o"),
+            Some((PaletteEntry::Settings, _))
+        ));
+    }
+
+    #[::core::prelude::v1::test]
+    fn entry_paste_keeps_unicode_arguments_and_plugin_expressions() {
+        assert_eq!(
+            parse_scope("f C:\\资料\\交接.md"),
+            Some((SearchMode::Files, "C:\\资料\\交接.md".into()))
+        );
+        for (value, prefix, expected) in [
+            ("c (18 + 6) / 3", "=", "(18 + 6) / 3"),
+            ("=sqrt(144)", "=", "sqrt(144)"),
+            ("r 中文翻译", "翻译", "中文翻译"),
+            ("d dictionary", "词典", "dictionary"),
+            ("u 12 km mi", "换算", "12 km mi"),
+        ] {
+            let Some((PaletteEntry::Plugin(actual), arguments)) = parse_entry(value) else {
+                panic!("missing plugin entry for {value}");
+            };
+            assert_eq!(actual, prefix);
+            assert_eq!(arguments, expected);
+        }
+        // Longer searches and file names remain global queries when pasted.
+        for query in [
+            "firefox",
+            "file.txt",
+            "G:\\项目",
+            "测试文件",
+            "settings.json",
+        ] {
+            assert!(parse_entry(query).is_none(), "unexpected entry for {query}");
+        }
+    }
+
     #[::core::prelude::v1::test]
     fn scope_aliases_require_space_and_preserve_query() {
-        assert_eq!(parse_scope_prefix("file"), None);
-        assert_eq!(parse_scope_prefix("file.txt"), None);
+        assert_eq!(parse_scope("file"), None);
+        assert_eq!(parse_scope("file.txt"), None);
         assert_eq!(
-            parse_scope_prefix(" File  C:\\资料\\交接.md"),
+            parse_scope(" File  C:\\资料\\交接.md"),
             Some((SearchMode::Files, "C:\\资料\\交接.md".into()))
         );
         assert_eq!(
-            parse_scope_prefix("apps "),
+            parse_scope("apps "),
             Some((SearchMode::Apps, String::new()))
         );
         assert_eq!(
-            parse_scope_prefix("正文\t检索内容"),
+            parse_scope("正文\t检索内容"),
             Some((SearchMode::Text, "检索内容".into()))
         );
-        assert_eq!(parse_scope_prefix("搜索 file 内容"), None);
+        assert_eq!(parse_scope("搜索 file 内容"), None);
     }
     #[::core::prelude::v1::test]
     fn shifted_number_row_keys_still_select_the_corresponding_result() {

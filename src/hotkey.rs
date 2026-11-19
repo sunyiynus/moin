@@ -36,11 +36,13 @@ pub enum FeatureAction {
     Translation,
     Dictionary,
     UnitConverter,
+    Screenshot,
+    GifRecording,
     Settings,
 }
 
 impl FeatureAction {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::All,
         Self::Apps,
         Self::Files,
@@ -50,6 +52,8 @@ impl FeatureAction {
         Self::Translation,
         Self::Dictionary,
         Self::UnitConverter,
+        Self::Screenshot,
+        Self::GifRecording,
         Self::Settings,
     ];
 
@@ -64,6 +68,8 @@ impl FeatureAction {
             Self::Translation => "翻译",
             Self::Dictionary => "词典",
             Self::UnitConverter => "单位换算",
+            Self::Screenshot => "截图",
+            Self::GifRecording => "GIF 录制",
             Self::Settings => "Moin 设置",
         }
     }
@@ -79,6 +85,8 @@ impl FeatureAction {
             Self::Translation => "唤起浮窗并输入要翻译的内容。",
             Self::Dictionary => "唤起浮窗并查询单词。",
             Self::UnitConverter => "唤起浮窗并输入换算内容。",
+            Self::Screenshot => "隐藏浮窗并框选屏幕区域，截图、复制或贴图。",
+            Self::GifRecording => "隐藏浮窗并框选屏幕区域，录制为 GIF 动图。",
             Self::Settings => "直接打开 Moin 设置窗口。",
         }
     }
@@ -360,7 +368,10 @@ mod tests {
     fn feature_shortcuts_round_trip_all_supported_targets_and_clear_bindings() {
         let mut features = FeatureShortcuts::default();
         for (index, feature) in FeatureAction::ALL.into_iter().enumerate() {
-            features.set(feature, format!("Ctrl+Alt+{}", index));
+            features.set(
+                feature,
+                format!("Ctrl+Alt+{}", char::from(b'A' + index as u8)),
+            );
         }
         let normalized = features.normalized("Alt+Space").unwrap();
         let restored: FeatureShortcuts =

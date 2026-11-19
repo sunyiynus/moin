@@ -1,8 +1,7 @@
 //! Shared UI assets. macOS must not depend on Windows-only symbol fonts.
 
-#[cfg(not(windows))]
-use gpui::svg;
 use gpui::{AssetSource, Div, Rems, SharedString, div, prelude::*, px, rems, rgb};
+use gpui_kit::component::{Icon, IconName};
 use std::borrow::Cow;
 
 pub fn font_family() -> &'static str {
@@ -53,33 +52,22 @@ pub fn shortcut_label(value: &str) -> String {
 }
 
 pub fn icon(symbol: &'static str, size: f32, color: u32) -> Div {
-    #[cfg(windows)]
-    {
-        div()
-            .flex_shrink_0()
-            .font_family("Segoe MDL2 Assets")
-            .text_size(px(size))
-            .text_color(rgb(color))
-            .child(symbol)
-    }
-    #[cfg(not(windows))]
-    {
-        div().flex_shrink_0().flex().items_center().child(
-            svg()
-                .path(icon_path(symbol))
-                .size(px(size))
-                .text_color(rgb(color)),
-        )
-    }
+    div().flex_shrink_0().flex().items_center().child(
+        Icon::new(IconName::Search)
+            .path(icon_path(symbol))
+            .size(px(size))
+            .text_color(rgb(color)),
+    )
 }
 
-#[cfg(not(windows))]
 fn icon_path(symbol: &str) -> &'static str {
     match symbol {
         "\u{e8f2}" => "icons/chat",
         "\u{e721}" => "icons/search",
         "\u{e713}" => "icons/settings",
         "\u{e765}" => "icons/keyboard",
+        "\u{e722}" => "icons/camera",
+        "\u{e714}" => "icons/video",
         "\u{e8d2}" => "icons/type",
         "\u{e8b7}" | "\u{e838}" => "icons/folder",
         "\u{e8a5}" => "icons/document",
@@ -101,6 +89,10 @@ impl AssetSource for Assets {
         let paths = match path {
             "icons/chat" => "<path d='M4 3h16v13H9l-5 5z'/><path d='M8 7h8M8 11h6'/>",
             "icons/search" => "<circle cx='11' cy='11' r='7'/><path d='m16 16 5 5'/>",
+            "icons/camera" => "<path d='M3 7h4l2-3h6l2 3h4v13H3z'/><circle cx='12' cy='13' r='4'/>",
+            "icons/video" => {
+                "<rect x='2' y='5' width='14' height='14' rx='2'/><path d='m16 10 6-4v12l-6-4z'/>"
+            }
             "icons/keyboard" => {
                 "<rect x='2' y='5' width='20' height='14' rx='2'/><path d='M5 9h1m3 0h1m3 0h1m3 0h1M5 12h1m3 0h1m3 0h1m3 0h1M6 16h12'/>"
             }
@@ -128,14 +120,14 @@ impl AssetSource for Assets {
             "icons/app" => {
                 "<rect x='3' y='3' width='7' height='7' rx='1'/><rect x='14' y='3' width='7' height='7' rx='1'/><rect x='3' y='14' width='7' height='7' rx='1'/><rect x='14' y='14' width='7' height='7' rx='1'/>"
             }
-            _ => return Ok(None),
+            _ => return gpui_kit::assets::Assets.load(path),
         };
         Ok(Some(Cow::Owned(format!(
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'>{paths}</svg>"
         ).into_bytes())))
     }
 
-    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok(Vec::new())
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        gpui_kit::assets::Assets.list(path)
     }
 }

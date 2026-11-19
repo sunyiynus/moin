@@ -37,6 +37,7 @@ impl AiPane {
                             .gap(px(5.))
                             .children(self.sessions.iter().enumerate().map(|(index, session)| {
                                 let id = session.id;
+                                let pane = cx.entity();
                                 let title = session.turns.first().map_or_else(
                                     || "新对话".to_owned(),
                                     |turn| {
@@ -49,45 +50,57 @@ impl AiPane {
                                             .collect()
                                     },
                                 );
-                                row()
-                                    .gap(px(2.))
+                                ListItem::new(("ai-session", id))
                                     .rounded(px(6.))
-                                    .when(index == self.selected, |s| s.bg(rgba(0xffffff15)))
+                                    .selected(index == self.selected)
+                                    .px(px(6.))
+                                    .text_color(rgb(CHAT_INK))
                                     .child(
-                                        chat_button(("session-select", id), "")
-                                            .flex_1()
+                                        row()
                                             .min_w_0()
-                                            .child(div().flex_1().min_w_0().truncate().child(title))
-                                            .when(session.busy, |s| {
-                                                s.child(
-                                                    div()
-                                                        .size(px(5.))
-                                                        .rounded_full()
-                                                        .bg(rgb(CHAT_ACCENT)),
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_size(rem(12.))
+                                                    .child(title),
+                                            )
+                                            .when(session.busy, |row| {
+                                                row.child(
+                                                    Spinner::new()
+                                                        .xsmall()
+                                                        .color(rgb(CHAT_ACCENT).into()),
                                                 )
-                                            })
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                if let Some(index) = view
-                                                    .sessions
-                                                    .iter()
-                                                    .position(|session| session.id == id)
-                                                {
-                                                    view.selected = index;
-                                                }
-                                                view.focus_input(window, cx);
-                                                cx.notify();
-                                            })),
+                                            }),
                                     )
-                                    .child(
+                                    .suffix(move |window, _| {
+                                        let handler = window.listener_for(
+                                            &pane,
+                                            move |view, _, window, cx| {
+                                                view.delete_session(id, window, cx);
+                                                view.focus_input(window, cx);
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            },
+                                        );
                                         chat_button(("session-delete", id), "删除")
                                             .px(px(4.))
                                             .text_size(rem(10.))
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                view.delete_session(id, window, cx);
-                                                view.focus_input(window, cx);
-                                                cx.notify();
-                                            })),
-                                    )
+                                            .on_click(handler)
+                                    })
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        if let Some(index) = view
+                                            .sessions
+                                            .iter()
+                                            .position(|session| session.id == id)
+                                        {
+                                            view.selected = index;
+                                        }
+                                        view.focus_input(window, cx);
+                                        cx.notify();
+                                    }))
                             })),
                     ),
             )
@@ -149,7 +162,7 @@ impl AiPane {
             )
             .child(
                 chat_button("new-ai-chat", "新对话")
-                    .child(keycap("Ctrl+N"))
+                    .child(chat_keycap("Ctrl+N"))
                     .on_click(cx.listener(|view, _, window, cx| view.new_ai_chat(window, cx))),
             )
             .child(
@@ -165,20 +178,22 @@ impl AiPane {
             })
     }
 
-    pub(super) fn ai_body(&self, _window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(super) fn ai_body(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let appearance = &self.appearance;
         let family = crate::app::appearance::resolve_ai_family(appearance);
         let ai_size = appearance.ai_font_size;
         let ai_line = ai_size * 1.65;
+        let command_preview_width = (f32::from(window.viewport_size().width)
+            - self.sidebar_width
+            - self.content_gutter * 2.
+            - 220.)
+            .max(64.);
         let style = markdown::MarkdownStyle {
             font_family: family.clone(),
             font_size: ai_size,
             line_height: ai_line,
             text_color: CHAT_INK,
             muted_color: CHAT_MUTED,
-            link_color: CHAT_ACCENT,
-            code_background: 0x101114b0,
-            rule_color: CHAT_LINE,
         };
         let mut body = div()
             .id("ai-conversation")
@@ -283,7 +298,7 @@ impl AiPane {
                             .bg(rgba(0x34363bdf))
                             .child(
                                 turn.question_markdown
-                                    .render(("ai-question-markdown", i), &style),
+                                    .render(("ai-question-markdown", turn.id), &style),
                             ),
                     ),
                 );
@@ -304,58 +319,61 @@ impl AiPane {
                     None if running => ("执行中".into(), CHAT_ACCENT),
                     None => ("已结束".into(), CHAT_MUTED),
                 };
-                let mut execution = div().min_w_0().flex().flex_col().gap(px(6.)).child(
-                    row()
-                        .id(("command-disclosure", i * 100 + j))
-                        .tab_index(0)
-                        .min_h(rem(30.))
-                        .min_w_0()
-                        .gap(px(8.))
-                        .px(px(6.))
-                        .rounded(px(5.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff08)))
-                        .focus(|s| s.bg(rgba(0x4d6bfe20)))
-                        .child(
-                            div()
-                                .text_size(rem(12.))
-                                .text_color(rgb(CHAT_MUTED))
-                                .child(if *expanded { "▾" } else { "▸" }),
-                        )
-                        .child(div().size(px(5.)).rounded_full().bg(rgb(color)))
-                        .child(
-                            div()
-                                .text_size(rem(12.))
-                                .text_color(rgb(CHAT_MUTED))
-                                .child("执行命令"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(crate::app::appearance::mono_font_family())
-                                .text_size(rem(12.))
-                                .text_color(rgb(CHAT_MUTED))
-                                .child(request.script.lines().next().unwrap_or("").to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_size(rem(12.))
-                                .text_color(rgb(color))
-                                .child(state),
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if let Some((_, _, expanded)) = view
-                                .turns
-                                .get_mut(i)
-                                .and_then(|turn| turn.commands.get_mut(j))
-                            {
-                                *expanded = !*expanded;
-                            }
-                            cx.notify();
-                        })),
-                );
+                let mut execution = Collapsible::new()
+                    .open(*expanded)
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(
+                        chat_button(("command-disclosure", i * 100 + j), "")
+                            .w_full()
+                            .min_h(rem(30.))
+                            .min_w_0()
+                            .gap(px(8.))
+                            .px(px(6.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .focus(|s| s.bg(rgba(0x4d6bfe20)))
+                            .child(
+                                div()
+                                    .text_size(rem(12.))
+                                    .text_color(rgb(CHAT_MUTED))
+                                    .child(if *expanded { "▾" } else { "▸" }),
+                            )
+                            .child(div().size(px(5.)).rounded_full().bg(rgb(color)))
+                            .child(
+                                div()
+                                    .text_size(rem(12.))
+                                    .text_color(rgb(CHAT_MUTED))
+                                    .child("执行命令"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .max_w(px(command_preview_width))
+                                    .truncate()
+                                    .font_family(crate::app::appearance::mono_font_family())
+                                    .text_size(rem(12.))
+                                    .text_color(rgb(CHAT_MUTED))
+                                    .child(request.script.lines().next().unwrap_or("").to_owned()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(rem(12.))
+                                    .text_color(rgb(color))
+                                    .child(state),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if let Some((_, _, expanded)) = view
+                                    .turns
+                                    .get_mut(i)
+                                    .and_then(|turn| turn.commands.get_mut(j))
+                                {
+                                    *expanded = !*expanded;
+                                }
+                                cx.notify();
+                            })),
+                    );
                 if *expanded {
                     let code = |label: String, content: String, id| {
                         div()
@@ -424,7 +442,7 @@ impl AiPane {
                             );
                         }
                     }
-                    execution = execution.child(details);
+                    execution = execution.content(details);
                 }
                 block = block.child(execution);
             }
@@ -456,29 +474,34 @@ impl AiPane {
                                 "尚未收到回复".into()
                             })
                     } else {
-                        turn.answer_markdown
-                            .render(("ai-answer-markdown", i), &style)
+                        div().w_full().min_w_0().child(
+                            turn.answer_markdown
+                                .render(("ai-answer-markdown", turn.id), &style),
+                        )
                     }),
             );
             if !turn.sources.is_empty() {
                 block = block.child(row().flex_wrap().gap(px(6.)).children(
                     turn.sources.iter().enumerate().map(|(j, source)| {
                         let path = source.path.clone();
-                        chat_button(
-                            ("ai-source", i * 100 + j),
-                            format!("[{}] {} · {}", j + 1, source.title, source.chunk),
-                        )
-                        .max_w_full()
-                        .min_w_0()
-                        .border_1()
-                        .border_color(rgba(CHAT_LINE))
-                        .text_color(rgb(CHAT_ACCENT))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if let Err(error) = open_path(&path) {
-                                view.error = Some(format!("无法打开来源 · {error:#}"));
-                            }
-                            cx.notify();
-                        }))
+                        chat_button(("ai-source", i * 100 + j), "")
+                            .child(div().max_w(px(240.)).truncate().child(format!(
+                                "[{}] {} · {}",
+                                j + 1,
+                                source.title,
+                                source.chunk
+                            )))
+                            .max_w_full()
+                            .min_w_0()
+                            .border_1()
+                            .border_color(rgba(CHAT_LINE))
+                            .text_color(rgb(CHAT_ACCENT))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if let Err(error) = open_path(&path) {
+                                    view.error = Some(format!("无法打开来源 · {error:#}"));
+                                }
+                                cx.notify();
+                            }))
                     }),
                 ));
             }
@@ -636,10 +659,11 @@ impl AiPane {
                                 chat_button("stop-ai", "停止")
                                     .bg(rgba(0xffffff18))
                                     .rounded(px(16.))
-                                    .child(keycap("Esc"))
+                                    .child(chat_keycap("Esc"))
                                     .on_click(cx.listener(|view, _, _, cx| view.stop_ai(cx)))
                             } else {
                                 chat_button("send-ai", "发送 ↑")
+                                    .disabled(!enabled)
                                     .rounded(px(16.))
                                     .px(px(14.))
                                     .when(enabled, |s| {

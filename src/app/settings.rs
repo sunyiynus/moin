@@ -1,6 +1,19 @@
 use std::path::PathBuf;
 
+use super::ui::UiWindow;
 use gpui::{prelude::*, *};
+use gpui_kit::component::{
+    Disableable, Icon, IconName, Root, Sizable,
+    alert::Alert,
+    button::{Button, ButtonVariants},
+    group_box::GroupBox,
+    kbd::Kbd,
+    label::Label,
+    radio::Radio,
+    sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
+    switch::Switch,
+    tag::Tag,
+};
 
 use super::{
     Moin,
@@ -11,7 +24,8 @@ use moin::search::everything;
 use moin::{
     ai::{AiConfig, AiProvider},
     config::{
-        AI_FONT_SIZE_MAX, AI_FONT_SIZE_MIN, AppearanceConfig, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
+        AI_FONT_SIZE_MAX, AI_FONT_SIZE_MIN, AppearanceConfig, CaptureConfig, UI_FONT_SIZE_MAX,
+        UI_FONT_SIZE_MIN,
     },
     hotkey::{self, FeatureAction, FeatureShortcuts, Shortcut},
 };
@@ -24,7 +38,6 @@ const PAPER: u32 = 0xf9f9f9;
 const RAIL: u32 = 0xf3f3f3;
 const WHITE: u32 = 0xffffff;
 const ACCENT: u32 = 0x0067c0;
-const TINT: u32 = 0xeaf3fb;
 
 const APPEARANCE_MARKDOWN_PREVIEW: &str = "**Moin** 支持 `Markdown` 渲染。\n\n- 列表项\n- **粗体**、*斜体* 与 [链接](https://example.com)\n\n> 引用文本\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```";
 
@@ -73,6 +86,8 @@ pub struct Snapshot {
     pub everything_enabled: bool,
     pub everything_status: everything::Status,
     pub everything_error: Option<String>,
+    pub capture: CaptureConfig,
+    pub capture_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +99,7 @@ enum Page {
     Appearance,
     App,
     Shortcuts,
+    Capture,
 }
 
 impl Page {
@@ -96,6 +112,7 @@ impl Page {
             Self::Appearance => "外观",
             Self::App => "常规",
             Self::Shortcuts => "快捷键",
+            Self::Capture => "截图与录制",
         }
     }
 
@@ -114,6 +131,7 @@ impl Page {
             Self::Appearance => "分别调整 AI 对话与其余界面的字体和字号。",
             Self::App => "设置 Moin 的激活快捷键，查看应用信息。",
             Self::Shortcuts => "为各功能分配全局快捷键，直接唤起浮窗并进入对应功能。",
+            Self::Capture => "框选屏幕截图、贴图，或将选定区域录制为 GIF 动图。",
         }
     }
 
@@ -126,6 +144,7 @@ impl Page {
             Self::Appearance => "\u{e8d2}",
             Self::App => "\u{e713}",
             Self::Shortcuts => "\u{e765}",
+            Self::Capture => "\u{e722}",
         }
     }
 }
@@ -160,26 +179,29 @@ pub struct Settings {
     ai_font_family: Entity<SearchInput>,
     ai_font_size: f32,
     appearance_error: Option<String>,
+    capture_directory: Entity<SearchInput>,
+    capture_fps: u16,
+    capture_seconds: u32,
+    capture_cursor: bool,
+    capture_picker_open: bool,
+    capture_error: Option<String>,
     _field_subscriptions: Vec<Subscription>,
     _subscription: Subscription,
 }
 
-pub fn open(launcher: WindowHandle<Moin>, cx: &mut App) -> anyhow::Result<WindowHandle<Settings>> {
+pub fn open(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
     open_page(launcher, Page::App, cx)
 }
 
-pub fn open_ai(
-    launcher: WindowHandle<Moin>,
-    cx: &mut App,
-) -> anyhow::Result<WindowHandle<Settings>> {
+pub fn open_ai(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
     open_page(launcher, Page::Ai, cx)
 }
 
 fn open_page(
-    launcher: WindowHandle<Moin>,
+    launcher: UiWindow<Moin>,
     page: Page,
     cx: &mut App,
-) -> anyhow::Result<WindowHandle<Settings>> {
+) -> anyhow::Result<UiWindow<Settings>> {
     let launcher = launcher.entity(cx)?;
     // Display bounds use logical pixels; leave room for the taskbar and title bar
     // on laptops with display scaling rather than opening below the screen edge.
@@ -206,14 +228,22 @@ fn open_page(
             window_min_size: Some(minimum),
             ..Default::default()
         },
-        move |_, cx| {
-            cx.new(|cx: &mut Context<Settings>| {
+        move |window, cx| {
+            let view = cx.new(|cx: &mut Context<Settings>| {
                 let snapshot = launcher.read(cx).settings_snapshot();
                 let config = snapshot.ai_config;
                 let appearance = snapshot.appearance;
+                let capture = snapshot.capture;
                 let ai_base_url = cx.new(|cx| SearchInput::field(&config.base_url, "服务地址", cx));
                 let ai_model = cx.new(|cx| {
                     SearchInput::field(&config.model, "填写已安装或服务支持的模型名称", cx)
+                });
+                let capture_directory = cx.new(|cx| {
+                    SearchInput::field(
+                        &capture.output_dir.to_string_lossy(),
+                        "截图与 GIF 的保存目录",
+                        cx,
+                    )
                 });
                 let ai_key_env =
                     cx.new(|cx| SearchInput::field(&config.api_key_env, "OPENAI_API_KEY", cx));
@@ -245,9 +275,13 @@ fn open_page(
                 })
                 .collect();
                 let mut subscriptions = subscriptions;
-                subscriptions.extend([&ui_font_family, &ai_font_family].into_iter().map(|field| {
-                    cx.subscribe(field, |_: &mut Settings, _, _: &Changed, cx| cx.notify())
-                }));
+                subscriptions.extend(
+                    [&ui_font_family, &ai_font_family, &capture_directory]
+                        .into_iter()
+                        .map(|field| {
+                            cx.subscribe(field, |_: &mut Settings, _, _: &Changed, cx| cx.notify())
+                        }),
+                );
                 Settings {
                     hotkey_draft: snapshot.activation_hotkey,
                     hotkey_recording: false,
@@ -273,14 +307,22 @@ fn open_page(
                     ai_font_family,
                     ai_font_size: appearance.ai_font_size,
                     appearance_error: None,
+                    capture_directory,
+                    capture_fps: capture.gif_fps,
+                    capture_seconds: capture.gif_max_seconds,
+                    capture_cursor: capture.include_cursor,
+                    capture_picker_open: false,
+                    capture_error: None,
                     _field_subscriptions: subscriptions,
                     _subscription: cx.observe(&launcher, |_, _, cx| cx.notify()),
                     launcher,
                     page,
                 }
-            })
+            });
+            cx.new(|cx| Root::new(view, window, cx))
         },
     )
+    .map(UiWindow::from_handle)
 }
 
 impl Render for Settings {
@@ -296,8 +338,9 @@ impl Render for Settings {
             Page::Appearance => self.appearance_page(snapshot, cx),
             Page::App => self.app_page(snapshot, cx),
             Page::Shortcuts => self.shortcuts_page(snapshot, cx),
+            Page::Capture => self.capture_page(snapshot, cx),
         };
-        div()
+        let tree = div()
             .size_full()
             .flex()
             .min_h_0()
@@ -313,9 +356,9 @@ impl Render for Settings {
                     cx.notify();
                 } else if event.keystroke.key == "tab" {
                     if event.keystroke.modifiers.shift {
-                        window.focus_prev();
+                        window.focus_prev(cx);
                     } else {
-                        window.focus_next();
+                        window.focus_next(cx);
                     }
                     cx.stop_propagation();
                 }
@@ -347,7 +390,8 @@ impl Render for Settings {
                             .pb(px(32.))
                             .child(content),
                     ),
-            )
+            );
+        super::ui::light(tree, cx)
     }
 }
 
@@ -378,94 +422,46 @@ impl Settings {
         true
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
-        column()
+    fn sidebar(&self, cx: &mut Context<Self>) -> Sidebar<SidebarMenu> {
+        Sidebar::new("settings-sidebar")
+            .collapsible(false)
             .w(px(224.))
             .min_h_0()
             .flex_shrink_0()
             .bg(rgb(RAIL))
-            .px(px(12.))
-            .pt(px(24.))
-            .pb(px(16.))
-            .child(
-                row()
-                    .gap(px(12.))
-                    .px(px(12.))
-                    .mb(px(26.))
-                    .child(
-                        row()
-                            .size(px(32.))
-                            .justify_center()
-                            .rounded(px(6.))
-                            .bg(rgb(ACCENT))
-                            .child(icon("\u{e713}", 18., WHITE)),
-                    )
-                    .child(
-                        column()
-                            .gap_1()
-                            .child(title("Moin", 17.))
-                            .child(description("设置")),
-                    ),
-            )
-            .child(
-                column()
-                    .id("settings-navigation")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .gap(px(4.))
-                    .children(
-                        [
-                            Page::App,
-                            Page::Shortcuts,
-                            Page::Appearance,
-                            Page::Search,
-                            Page::Index,
-                            Page::Ai,
-                            Page::Plugins,
-                        ]
-                        .map(|page| {
-                            let selected = self.page == page;
-                            row()
-                                .id(("settings-page", page as usize))
-                                .tab_index(0)
-                                .min_h(rem(40.))
-                                .py(px(8.))
-                                .gap(px(12.))
-                                .pr(px(10.))
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(rgba(0x00000000))
-                                .when(selected, |item| item.bg(rgb(0xe8e8e8)))
-                                .hover(|item| item.bg(rgb(0xeaeaea)))
-                                .focus(|item| item.border_color(rgb(ACCENT)))
-                                .cursor_pointer()
-                                .text_size(rem(14.))
-                                .child(
-                                    div()
-                                        .w(px(3.))
-                                        .h(rem(16.))
-                                        .flex_shrink_0()
-                                        .rounded(px(2.))
-                                        .bg(rgba(if selected { 0x0067c0ff } else { 0x00000000 })),
-                                )
-                                .child(icon(page.icon(), 17., if selected { ACCENT } else { INK }))
-                                .child(page.label())
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.page = page;
-                                    view.hotkey_recording = false;
-                                    cx.notify();
-                                }))
-                        }),
-                    ),
-            )
-            .child(
+            .header(
                 column()
                     .px(px(12.))
-                    .pt(px(16.))
+                    .py(px(16.))
                     .gap_1()
-                    .child(description(format!("Moin {}", env!("CARGO_PKG_VERSION")))),
+                    .child(title("Moin", 17.))
+                    .child(description("设置")),
             )
+            .child(
+                SidebarMenu::new().children(
+                    [
+                        Page::App,
+                        Page::Shortcuts,
+                        Page::Appearance,
+                        Page::Search,
+                        Page::Index,
+                        Page::Ai,
+                        Page::Capture,
+                        Page::Plugins,
+                    ]
+                    .map(|page| {
+                        SidebarMenuItem::new(page.label())
+                            .icon(kit_icon_name(page.icon()))
+                            .active(self.page == page)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.page = page;
+                                view.hotkey_recording = false;
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
+            .footer(description(format!("Moin {}", env!("CARGO_PKG_VERSION"))))
     }
 
     fn search_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
@@ -602,7 +598,7 @@ impl Settings {
         status: &everything::Status,
         error: Option<String>,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> GroupBox {
         let (label, color) = everything_status_label(enabled, status);
         let executable = status.executable().map(PathBuf::from);
         section("文件名搜索")
@@ -612,26 +608,12 @@ impl Settings {
                     "Everything 文件名搜索",
                     "直接使用 Everything 搜索文件名、文件夹和路径，支持 `\\` 或 `/` 分隔符，无需设置搜索目录。未连接时文件搜索不可用。",
                 )
-                .id("everything-toggle")
-                .tab_index(0)
-                .cursor_pointer()
-                .focus(|row| row.border_color(rgb(ACCENT)))
-                .child(toggle(enabled))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.launcher.update(cx, |launcher, cx| {
-                        launcher.set_everything_enabled(!enabled, cx)
-                    });
-                    cx.notify();
-                }))
-                .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        view.launcher.update(cx, |launcher, cx| {
-                            launcher.set_everything_enabled(!enabled, cx)
-                        });
-                        cx.stop_propagation();
+                .child(Switch::new("everything-toggle").checked(enabled)
+                    .label(if enabled {"开启"} else {"关闭"})
+                    .on_click(cx.listener(move|view,checked:&bool,_,cx| {
+                        view.launcher.update(cx,|launcher,cx|launcher.set_everything_enabled(*checked,cx));
                         cx.notify();
-                    }
-                })),
+                    }))),
             )
             .child(
                 card()
@@ -770,7 +752,7 @@ impl Settings {
                                 (AiProvider::OpenAiCompatible, "OpenAI 兼容", "ai-provider-openai"),
                             ].into_iter().map(|(provider, label, id)| {
                                 let selected = self.ai_provider == provider;
-                                button(id, label, selected, true).on_click(cx.listener(move |view, _, _, cx| {
+                                Radio::new(id).label(label).checked(selected).on_click(cx.listener(move |view, _, _, cx| {
                                     view.select_ai_provider(provider.clone(), cx);
                                 }))
                             }))),
@@ -789,14 +771,10 @@ impl Settings {
             .child(
                 section("任务执行")
                     .child(setting_row("\u{e713}", "允许执行本机命令", "以当前用户权限执行命令和脚本。执行输出会发送给所选模型，可在对话中停止任务。")
-                        .id("ai-allow-commands").tab_index(0)
-                        .focus(|style| style.border_color(rgb(ACCENT)))
-                        .hover(|style| style.bg(rgb(0xfdfdfd))).cursor_pointer()
-                        .child(toggle(self.ai_allow_commands))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.ai_allow_commands = !view.ai_allow_commands;
-                            view.update_ai_dirty(cx); cx.notify();
-                        })))
+                        .child(Switch::new("ai-allow-commands").checked(self.ai_allow_commands)
+                            .on_click(cx.listener(|view,checked:&bool,_,cx| {
+                                view.ai_allow_commands=*checked;view.update_ai_dirty(cx);cx.notify();
+                            }))))
                     .child(input_field("ai-command-directory", "命令工作目录", &self.ai_command_directory, cx))
                     .child(description("填写已存在的绝对路径。Windows 使用 PowerShell，macOS 默认使用 sh；调用之间不保留会话。")),
             )
@@ -806,17 +784,10 @@ impl Settings {
                     .child(description("角色指令可留空，使用 Moin 默认角色。"))
                     .child(
                         setting_row("\u{e8a5}", "检索本地文档", "将检索到的相关正文发送给所选模型。需要模型支持工具调用。")
-                            .id("ai-local-documents")
-                            .tab_index(0)
-                            .focus(|style| style.border_color(rgb(ACCENT)))
-                            .hover(|style| style.bg(rgb(0xfdfdfd)))
-                            .cursor_pointer()
-                            .child(toggle(self.ai_use_documents))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.ai_use_documents = !view.ai_use_documents;
-                                view.update_ai_dirty(cx);
-                                cx.notify();
-                            })),
+                            .child(Switch::new("ai-local-documents").checked(self.ai_use_documents)
+                                .on_click(cx.listener(|view,checked:&bool,_,cx| {
+                                    view.ai_use_documents=*checked;view.update_ai_dirty(cx);cx.notify();
+                                }))),
                     ),
             )
             .child(
@@ -845,9 +816,6 @@ impl Settings {
             line_height: draft.ai_font_size * 1.62,
             text_color: INK,
             muted_color: MUTED,
-            link_color: ACCENT,
-            code_background: 0xf0f0f0ff,
-            rule_color: (LINE << 8) | 0xff,
         };
         column()
             .gap(px(24.))
@@ -1087,6 +1055,266 @@ impl Settings {
         cx.notify();
     }
 
+    fn capture_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
+        let dirty = self.capture_draft(cx) != snapshot.capture.normalized();
+        let can_save = dirty && !self.capture_picker_open;
+        column()
+            .gap(px(24.))
+            .child(
+                section("保存位置")
+                    .child(input_field(
+                        "capture-output-directory",
+                        "保存目录",
+                        &self.capture_directory,
+                        cx,
+                    ))
+                    .child(
+                        row().gap(px(8.)).child(
+                            button(
+                                "choose-capture-directory",
+                                if self.capture_picker_open {
+                                    "正在选择…"
+                                } else {
+                                    "选择文件夹"
+                                },
+                                false,
+                                !self.capture_picker_open,
+                            )
+                            .when(
+                                !self.capture_picker_open,
+                                |control| {
+                                    control.on_click(
+                                        cx.listener(|view, _, _, cx| {
+                                            view.choose_capture_folder(cx)
+                                        }),
+                                    )
+                                },
+                            ),
+                        ),
+                    )
+                    .child(description(
+                        "截图保存为 PNG，录制保存为 GIF。首次保存时会自动创建目录。",
+                    )),
+            )
+            .child(
+                section("截图与录制")
+                    .child(
+                        setting_row(
+                            "\u{e722}",
+                            "包含鼠标指针",
+                            "在截图和录制画面中显示鼠标指针。",
+                        )
+                        .child(
+                            Switch::new("capture-include-cursor")
+                                .checked(self.capture_cursor)
+                                .on_click(cx.listener(|view, checked: &bool, _, cx| {
+                                    view.capture_cursor = *checked;
+                                    view.capture_error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
+                        setting_row(
+                            "\u{e722}",
+                            "GIF 帧率",
+                            format!(
+                                "每秒 {} 帧。帧率越高，画面越流畅，文件也越大。",
+                                self.capture_fps
+                            ),
+                        )
+                        .child(
+                            row().flex_wrap().gap(px(4.)).children(
+                                [(5u16, "5"), (10, "10"), (15, "15"), (20, "20"), (30, "30")]
+                                    .into_iter()
+                                    .map(|(fps, label)| {
+                                        button(
+                                            ("capture-gif-fps", fps as usize),
+                                            label,
+                                            self.capture_fps == fps,
+                                            true,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |view, _, _, cx| {
+                                                view.capture_fps = fps;
+                                                view.capture_error = None;
+                                                cx.notify();
+                                            }),
+                                        )
+                                    }),
+                            ),
+                        ),
+                    )
+                    .child(
+                        setting_row(
+                            "\u{e722}",
+                            "最长录制时长",
+                            format!(
+                                "{} 秒后自动停止，也可以提前手动结束。",
+                                self.capture_seconds
+                            ),
+                        )
+                        .child(
+                            row().flex_wrap().gap(px(4.)).children(
+                                [
+                                    (15u32, "15 秒"),
+                                    (30, "30 秒"),
+                                    (60, "60 秒"),
+                                    (120, "120 秒"),
+                                ]
+                                .into_iter()
+                                .map(|(seconds, label)| {
+                                    button(
+                                        ("capture-gif-seconds", seconds as usize),
+                                        label,
+                                        self.capture_seconds == seconds,
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |view, _, _, cx| {
+                                            view.capture_seconds = seconds;
+                                            view.capture_error = None;
+                                            cx.notify();
+                                        },
+                                    ))
+                                }),
+                            ),
+                        ),
+                    ),
+            )
+            .child(
+                section("快捷入口").child(
+                    setting_row(
+                        "\u{e765}",
+                        "截图与录制快捷键",
+                        "在「快捷键」页面为截图和 GIF 录制分别分配全局快捷键。",
+                    )
+                    .child(
+                        button("capture-open-shortcuts", "配置快捷键", false, true).on_click(
+                            cx.listener(|view, _, _, cx| {
+                                view.page = Page::Shortcuts;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+                ),
+            )
+            .child(
+                column()
+                    .gap(px(10.))
+                    .child(
+                        row()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(
+                                button("save-capture-config", "保存截图与录制设置", true, can_save)
+                                    .when(can_save, |control| {
+                                        control.on_click(
+                                            cx.listener(|view, _, _, cx| {
+                                                view.save_capture_draft(cx)
+                                            }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                button("restore-capture-config", "还原已保存设置", false, can_save)
+                                    .when(can_save, |control| {
+                                        control.on_click(cx.listener(|view, _, _, cx| {
+                                            view.restore_capture_draft(cx)
+                                        }))
+                                    }),
+                            ),
+                    )
+                    .when(dirty, |section| {
+                        section.child(description("有未保存的修改。"))
+                    })
+                    .children(
+                        self.capture_error
+                            .clone()
+                            .or(snapshot.capture_error)
+                            .into_iter()
+                            .map(error_message),
+                    ),
+            )
+    }
+
+    fn capture_draft(&self, cx: &App) -> CaptureConfig {
+        CaptureConfig {
+            output_dir: PathBuf::from(self.capture_directory.read(cx).value().trim()),
+            gif_fps: self.capture_fps,
+            gif_max_seconds: self.capture_seconds,
+            include_cursor: self.capture_cursor,
+        }
+        .normalized()
+    }
+
+    fn choose_capture_folder(&mut self, cx: &mut Context<Self>) {
+        if self.capture_picker_open {
+            return;
+        }
+        self.capture_picker_open = true;
+        self.capture_error = None;
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择截图与 GIF 保存目录".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let result = picker.await;
+            let _ = view.update(cx, |view, cx| {
+                view.capture_picker_open = false;
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            view.capture_directory.update(cx, |input, cx| {
+                                input.set_value(path.to_string_lossy().into_owned(), cx);
+                            });
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        view.capture_error = Some(format!("无法选择保存目录 · {error:#}"))
+                    }
+                    Err(_) => view.capture_error = Some("目录选择器已关闭".into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_capture_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self.capture_draft(cx);
+        let result = draft.clone().validated().and_then(|config| {
+            self.launcher
+                .update(cx, |launcher, cx| launcher.save_capture_config(config, cx))
+        });
+        match result {
+            Ok(()) => {
+                self.capture_directory.update(cx, |input, cx| {
+                    input.set_value(draft.output_dir.to_string_lossy().into_owned(), cx);
+                });
+                self.capture_error = None;
+            }
+            Err(error) => self.capture_error = Some(format!("截图与录制设置未保存 · {error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn restore_capture_draft(&mut self, cx: &mut Context<Self>) {
+        let capture = self.launcher.read(cx).settings_snapshot().capture;
+        self.capture_directory.update(cx, |input, cx| {
+            input.set_value(capture.output_dir.to_string_lossy().into_owned(), cx);
+        });
+        self.capture_fps = capture.gif_fps;
+        self.capture_seconds = capture.gif_max_seconds;
+        self.capture_cursor = capture.include_cursor;
+        self.capture_error = None;
+        cx.notify();
+    }
+
     fn plugins_page(&self, snapshot: Snapshot) -> Div {
         let directory = snapshot.data_dir.clone();
         column()
@@ -1151,25 +1379,12 @@ impl Settings {
                     let focus = self.feature_focus.get(&feature).expect("feature focus");
                     setting_row("\u{e765}", feature.label(), feature.description())
                         .child(row().flex_wrap().gap(px(6.))
-                            .child(row().id(("feature-hotkey", feature as usize))
-                                .track_focus(focus).tab_index(0)
-                                .min_w(px(168.)).min_h(rem(34.))
-                                .px(px(12.)).py(px(4.)).justify_center()
-                                .rounded(px(4.)).border_1()
-                                .border_color(rgb(if recording { ACCENT } else { 0xd1d1d1 }))
-                                .bg(rgb(if recording { TINT } else { WHITE }))
-                                .focus(|style| style.border_color(rgb(ACCENT)))
-                                .child(title(if recording { "请按组合键…".to_owned() }
-                                    else if value.is_empty() { "未分配".to_owned() }
-                                    else { value.to_owned() }, 14.))
-                                .when(!busy, |control| control.cursor_pointer()
-                                    .hover(|style| style.bg(rgb(TINT)))
-                                    .on_click(cx.listener(move |view, _, window, cx| {
-                                        view.feature_recording = Some(feature);
-                                        view.hotkey_recording = true;
-                                        view.hotkey_capture_error = None;
-                                        view.recording_focus().focus(window);
-                                        cx.notify();
+                            .child(row().id(("feature-hotkey-focus",feature as usize)).track_focus(focus)
+                                .child(shortcut_button(("feature-hotkey",feature as usize),value,recording,!busy)
+                                    .on_click(cx.listener(move|view,_,window,cx| {
+                                        view.feature_recording=Some(feature);
+                                        view.hotkey_recording=true;view.hotkey_capture_error=None;
+                                        view.recording_focus().focus(window, cx);cx.notify();
                                     }))))
                             .child(button(("clear-feature-hotkey", feature as usize), "清除", false, !busy && !value.is_empty())
                                 .when(!busy && !value.is_empty(), |control| control.on_click(cx.listener(move |view, _, _, cx| {
@@ -1270,43 +1485,25 @@ impl Settings {
                         )
                         .child(
                             row()
-                                .id("activation-hotkey")
+                                .id("activation-hotkey-focus")
                                 .track_focus(&self.hotkey_focus)
-                                .tab_index(0)
-                                .min_w(px(168.))
-                                .min_h(rem(34.))
-                                .px(px(12.))
-                                .py(px(4.))
-                                .justify_center()
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(rgb(if self.hotkey_recording {
-                                    ACCENT
-                                } else {
-                                    0xd1d1d1
-                                }))
-                                .bg(rgb(if self.hotkey_recording { TINT } else { WHITE }))
-                                .focus(|style| style.border_color(rgb(ACCENT)))
-                                .child(title(
-                                    if self.hotkey_recording {
-                                        "请按组合键…".to_owned()
-                                    } else {
-                                        self.hotkey_draft.clone()
-                                    },
-                                    14.,
-                                ))
-                                .when(!busy, |control| {
-                                    control
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(TINT)))
-                                        .on_click(cx.listener(|view, _, window, cx| {
+                                .child(
+                                    shortcut_button(
+                                        "activation-hotkey",
+                                        &self.hotkey_draft,
+                                        self.hotkey_recording,
+                                        !busy,
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, window, cx| {
                                             view.feature_recording = None;
                                             view.hotkey_recording = true;
                                             view.hotkey_capture_error = None;
-                                            view.hotkey_focus.focus(window);
+                                            view.hotkey_focus.focus(window, cx);
                                             cx.notify();
-                                        }))
-                                }),
+                                        },
+                                    )),
+                                ),
                         ),
                     )
                     .when(self.hotkey_recording, |section| {
@@ -1441,12 +1638,13 @@ fn card() -> Div {
         .rounded(px(5.))
 }
 
-fn section(label: &'static str) -> Div {
-    column()
+fn section(label: &'static str) -> GroupBox {
+    GroupBox::new()
+        .id(SharedString::from(format!("settings-section-{label}")))
+        .title(title(label, 14.))
         .min_w_0()
         .flex_shrink_0()
-        .gap(px(4.))
-        .child(div().mb(px(8.)).child(title(label, 14.)))
+        .gap(px(8.))
 }
 
 fn setting_row(
@@ -1480,42 +1678,24 @@ fn setting_row(
         )
 }
 
-fn toggle(enabled: bool) -> Div {
-    row()
-        .flex_shrink_0()
-        .gap(px(10.))
-        .child(description(if enabled { "开启" } else { "关闭" }))
-        .child(
-            row()
-                .w(px(40.))
-                .h(px(20.))
-                .px(px(3.))
-                .rounded_full()
-                .border_1()
-                .border_color(rgb(if enabled { ACCENT } else { 0x8a8a8a }))
-                .bg(rgb(if enabled { ACCENT } else { WHITE }))
-                .when(enabled, |track| track.justify_end())
-                .child(div().size(px(12.)).rounded_full().bg(rgb(if enabled {
-                    WHITE
-                } else {
-                    0x626262
-                }))),
-        )
-}
-
-fn title(text: impl Into<SharedString>, size: f32) -> Div {
-    div()
+fn title(text: impl Into<SharedString>, size: f32) -> Label {
+    let text = text.into();
+    // GPUI keys a component's accessibility node by its whole id path, and
+    // `Label::new` only sees this helper as the call site. Every label built here
+    // would therefore share one element id and trip the duplicate-node assertion
+    // once accessibility is active, so name each label after what it shows.
+    Label::new(text.clone())
+        .id((ElementId::from("settings-title"), text))
         .text_size(rem(size))
         .font_weight(FontWeight::SEMIBOLD)
-        .child(text.into())
 }
-
-fn description(text: impl Into<SharedString>) -> Div {
-    div()
+fn description(text: impl Into<SharedString>) -> Label {
+    let text = text.into();
+    Label::new(text.clone())
+        .id((ElementId::from("settings-description"), text))
         .text_size(rem(13.))
         .line_height(rem(21.))
         .text_color(rgb(MUTED))
-        .child(text.into())
 }
 
 fn input_field(
@@ -1552,77 +1732,228 @@ fn input_field(
                 .cursor(CursorStyle::IBeam)
                 .hover(|style| style.bg(rgb(0xfafafa)))
                 .focus(|style| style.border_color(rgb(ACCENT)))
-                .on_click(move |_, window, cx| target.read(cx).focus(window, cx))
+                .on_click(move |_, window, cx| target.update(cx, |input, cx| input.focus(window, cx)))
                 .child(input.clone()),
         )
 }
 
-fn icon(glyph: &'static str, size: f32, color: u32) -> Div {
-    super::appearance::icon(glyph, size, color)
+fn kit_icon_name(glyph: &str) -> IconName {
+    match glyph {
+        "\u{e721}" => IconName::Search,
+        "\u{e8a5}" => IconName::File,
+        "\u{e8b7}" => IconName::Folder,
+        "\u{e8f2}" => IconName::Bot,
+        "\u{e8d2}" => IconName::ALargeSmall,
+        "\u{e765}" => IconName::SquareTerminal,
+        "\u{e722}" => IconName::Frame,
+        "\u{ea86}" => IconName::LayoutDashboard,
+        _ => IconName::Settings,
+    }
 }
-
-fn command_label(text: impl Into<SharedString>) -> Div {
-    div()
-        .px_2()
-        .py_1()
-        .rounded(px(5.))
-        .bg(rgb(TINT))
-        .text_color(rgb(ACCENT))
-        .font_weight(FontWeight::MEDIUM)
-        .text_size(rem(13.))
-        .child(text.into())
+fn icon(glyph: &'static str, size: f32, color: u32) -> Icon {
+    Icon::new(kit_icon_name(glyph))
+        .size(px(size))
+        .text_color(rgb(color))
 }
-
-fn error_message(message: String) -> Div {
-    div()
-        .px_3()
-        .py_2()
-        .rounded(px(6.))
-        .text_size(rem(13.))
-        .line_height(rem(21.))
-        .text_color(rgb(0x963e2b))
-        .bg(rgb(0xfaeee9))
-        .child(message)
+fn command_label(text: impl Into<SharedString>) -> Tag {
+    Tag::new().child(text.into()).text_size(rem(13.))
 }
-
+fn error_message(message: String) -> Alert {
+    Alert::error(
+        SharedString::from(format!("settings-error-{message}")),
+        message,
+    )
+    .small()
+}
 fn button(
     id: impl Into<ElementId>,
-    label: &'static str,
+    label: impl Into<SharedString>,
     primary: bool,
     enabled: bool,
-) -> Stateful<Div> {
-    let background = if !enabled {
-        RAIL
-    } else if primary {
-        ACCENT
+) -> Button {
+    Button::new(id)
+        .label(label)
+        .small()
+        .disabled(!enabled)
+        .when(primary, |button| button.primary())
+}
+
+fn shortcut_button(
+    id: impl Into<ElementId>,
+    value: &str,
+    recording: bool,
+    enabled: bool,
+) -> Button {
+    let mut control = Button::new(id)
+        .small()
+        .min_w(px(168.))
+        .h(rem(34.))
+        .disabled(!enabled);
+    if recording {
+        return control.label("请按组合键…").primary();
+    }
+    if value.is_empty() {
+        return control.label("未分配");
+    }
+    let source = value
+        .replace('+', "-")
+        .to_ascii_lowercase()
+        .replace("option-", "alt-");
+    if let Ok(stroke) = super::parse_keystroke(&source) {
+        control = control.label("").child(Kbd::new(stroke).appearance(false));
     } else {
-        WHITE
-    };
-    row()
-        .id(id)
-        .min_h(rem(34.))
-        .py(px(4.))
-        .flex_shrink_0()
-        .px_3()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(rgb(if background == ACCENT { ACCENT } else { LINE }))
-        .bg(rgb(background))
-        .text_size(rem(13.))
-        .text_color(rgb(if background == ACCENT {
-            WHITE
-        } else if enabled {
-            INK
-        } else {
-            MUTED
-        }))
-        .when(enabled, |button| {
-            button
-                .tab_index(0)
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(if primary { 0x1975c5 } else { 0xf3f3f3 })))
-                .active(move |style| style.bg(rgb(if primary { 0x3183ca } else { 0xececec })))
-                .focus(|style| style.border_2().border_color(rgb(ACCENT)))
-        })
-        .child(label)
+        control = control.label(value.to_owned());
+    }
+    control.tooltip("点击录制快捷键")
+}
+
+#[cfg(test)]
+mod kit_tests {
+    use super::*;
+
+    struct Controls {
+        enabled: bool,
+        toggles: usize,
+        saved: usize,
+        recording: bool,
+        shortcut: String,
+        capture_focus: FocusHandle,
+    }
+
+    impl Render for Controls {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            column()
+                .size_full()
+                .p_4()
+                .bg(rgb(PAPER))
+                .text_color(rgb(INK))
+                .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                    if view.recording && view.capture_focus.is_focused(window) {
+                        let modifiers = event.keystroke.modifiers;
+                        let mask = (if modifiers.control {
+                            hotkey::CONTROL
+                        } else {
+                            0
+                        }) | (if modifiers.shift { hotkey::SHIFT } else { 0 });
+                        if let Ok(shortcut) = Shortcut::from_key(&event.keystroke.key, mask) {
+                            view.shortcut = shortcut.label();
+                            view.recording = false;
+                            cx.notify();
+                        }
+                    }
+                }))
+                .child(
+                    section("组件交互")
+                        .child(
+                            setting_row(
+                                "\u{e8f2}",
+                                "允许执行本机命令",
+                                "点击开关后只更新一次状态。",
+                            )
+                            .child(
+                                row()
+                                    .debug_selector(|| "settings-test-switch".into())
+                                    .child(
+                                        Switch::new("settings-test-switch-control")
+                                            .checked(self.enabled)
+                                            .on_click(cx.listener(
+                                                |view, checked: &bool, _, cx| {
+                                                    view.enabled = *checked;
+                                                    view.toggles += 1;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            ),
+                        )
+                        .child(
+                            row()
+                                .debug_selector(|| "settings-test-disabled-save".into())
+                                .child(
+                                    button(
+                                        "settings-test-disabled-save-control",
+                                        "保存设置",
+                                        true,
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, _, cx| {
+                                            view.saved += 1;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(
+                            row()
+                                .id("settings-test-focus")
+                                .track_focus(&self.capture_focus)
+                                .debug_selector(|| "settings-test-shortcut".into())
+                                .child(
+                                    shortcut_button(
+                                        "settings-test-shortcut-control",
+                                        &self.shortcut,
+                                        self.recording,
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, window, cx| {
+                                            view.recording = true;
+                                            view.capture_focus.focus(window, cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        ),
+                )
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn kit_settings_controls_preserve_toggle_disabled_and_shortcut_interactions() {
+        let mut app = TestAppContext::single();
+        app.update(super::super::ui::init);
+        let view = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = view.clone();
+        let (_, cx) = app.add_window_view(move |window, cx| {
+            let controls = cx.new(|cx| Controls {
+                enabled: false,
+                toggles: 0,
+                saved: 0,
+                recording: false,
+                shortcut: "Alt+Space".into(),
+                capture_focus: cx.focus_handle(),
+            });
+            *captured.borrow_mut() = Some(controls.clone());
+            Root::new(controls, window, cx)
+        });
+        let view = view.borrow_mut().take().unwrap();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let toggle = cx.debug_bounds("settings-test-switch").unwrap();
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.read(|cx| {
+            let view = view.read(cx);
+            assert!(view.enabled);
+            assert_eq!(view.toggles, 1);
+        });
+        let disabled = cx.debug_bounds("settings-test-disabled-save").unwrap();
+        cx.simulate_click(
+            point(disabled.left() + px(32.), disabled.top() + px(10.)),
+            Modifiers::default(),
+        );
+        cx.read(|cx| assert_eq!(view.read(cx).saved, 0));
+        let shortcut = cx.debug_bounds("settings-test-shortcut").unwrap();
+        cx.simulate_click(
+            point(shortcut.left() + px(32.), shortcut.top() + px(10.)),
+            Modifiers::default(),
+        );
+        cx.simulate_keystrokes("ctrl-shift-h");
+        cx.read(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.shortcut, "Ctrl+Shift+H");
+            assert!(!view.recording);
+        });
+    }
 }

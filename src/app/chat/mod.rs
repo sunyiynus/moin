@@ -1,5 +1,15 @@
+use super::ui::UiWindow;
 use super::*;
 use super::{appearance::rem, launcher_window, settings};
+use gpui_kit::component::{
+    Disableable, Sizable,
+    avatar::Avatar,
+    button::{Button, ButtonVariants},
+    collapsible::Collapsible,
+    kbd::Kbd,
+    list::ListItem,
+    spinner::Spinner,
+};
 use moin::ai::{self, AiConfig, CancelToken, ChatEvent, ChatMessage, ChatRole, Source};
 use moin::config::AppearanceConfig;
 use std::collections::HashMap;
@@ -245,8 +255,8 @@ pub(super) struct AiChat {
     pub active: bool,
     pub pane: Entity<AiPane>,
     store: Entity<ChatStore>,
-    detached: Option<WindowHandle<AiPane>>,
-    launcher: Option<WindowHandle<Moin>>,
+    detached: Option<UiWindow<AiPane>>,
+    launcher: Option<UiWindow<Moin>>,
 }
 impl AiChat {
     pub fn new(
@@ -401,7 +411,7 @@ impl AiPane {
                 input.set_rem_size(size / base, size * 1.65 / base);
                 cx.notify();
             });
-            let follow = ui.scroll.max_offset().height + ui.scroll.offset().y < px(64.);
+            let follow = ui.scroll.max_offset().y + ui.scroll.offset().y < px(64.);
             let old_last = ui.turns.last().map(|turn| (turn.id, turn.answer.len()));
             let mut old_turns = std::mem::take(&mut ui.turns)
                 .into_iter()
@@ -452,8 +462,8 @@ impl AiPane {
             .and_then(|id| self.sessions.iter().position(|session| session.id == id))
             .unwrap_or(0);
     }
-    pub(super) fn focus_input(&self, window: &mut Window, cx: &App) {
-        self.input.read(cx).focus(window, cx);
+    pub(super) fn focus_input(&self, window: &mut Window, cx: &mut App) {
+        self.input.update(cx, |input, cx| input.focus(window, cx));
     }
     pub(super) fn input_focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
@@ -581,7 +591,7 @@ impl AiPane {
     fn set_ai(&mut self, _: bool, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.owner.update(cx, |view, cx| {
             view.ai.active = false;
-            view.input.read(cx).focus(window, cx);
+            view.input.update(cx, |input, cx| input.focus(window, cx));
             cx.notify();
         });
     }
@@ -600,7 +610,7 @@ impl Render for AiPane {
         } else {
             36.
         };
-        div()
+        let content = div()
             .key_context("MoinAiPane")
             .size_full()
             .min_w_0()
@@ -620,9 +630,9 @@ impl Render for AiPane {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" && !view.composing(cx) {
                     if event.keystroke.modifiers.shift {
-                        window.focus_prev();
+                        window.focus_prev(cx);
                     } else {
-                        window.focus_next();
+                        window.focus_next(cx);
                     }
                     cx.stop_propagation();
                 }
@@ -659,7 +669,8 @@ impl Render for AiPane {
                 }
             }))
             .child(self.ai_header(window, cx))
-            .child(self.ai_workspace(window, cx))
+            .child(self.ai_workspace(window, cx));
+        super::ui::dark(content, cx)
     }
 }
 
@@ -684,16 +695,16 @@ pub(super) fn bind_keys(cx: &mut App) {
 }
 
 impl Moin {
-    pub(super) fn focus_input(&self, window: &mut Window, cx: &App) {
+    pub(super) fn focus_input(&self, window: &mut Window, cx: &mut App) {
         if self.ai.active {
-            self.ai.pane.read(cx).focus_input(window, cx);
+            self.ai.pane.update(cx, |pane, cx| pane.focus_input(window, cx));
         } else {
-            self.input.read(cx).focus(window, cx);
+            self.input.update(cx, |input, cx| input.focus(window, cx));
         }
     }
     pub(super) fn set_ai(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.ai.active = active;
-        self.ai.launcher = window.window_handle().downcast::<Self>();
+        self.ai.launcher = UiWindow::from_window(window);
         self.actions_open = false;
         self.focus_input(window, cx);
         cx.notify();
@@ -845,13 +856,15 @@ impl Moin {
                         });
                         true
                     });
-                    cx.new(|cx| AiPane::new(store, root_owner, true, selected_id, cx))
+                    let pane = cx.new(|cx| AiPane::new(store, root_owner, true, selected_id, cx));
+                    pane.update(cx, |pane, cx| pane.focus_input(window, cx));
+                    super::ui::root(pane, window, cx)
                 },
             );
             let opened = result.is_ok();
             owner.update(cx, |view, cx| {
                 match result {
-                    Ok(handle) => view.ai.detached = Some(handle),
+                    Ok(handle) => view.ai.detached = Some(UiWindow::from_handle(handle)),
                     Err(error) => view.ai_error = Some(format!("无法打开对话窗口 · {error:#}")),
                 }
                 cx.notify();
@@ -870,10 +883,11 @@ const CHAT_MUTED: u32 = 0xb0b2bb;
 const CHAT_ACCENT: u32 = 0xa5b5ff;
 const CHAT_LINE: u32 = 0xffffff1a;
 
-fn chat_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-    row()
-        .id(id)
-        .tab_index(0)
+fn chat_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .label(label)
         .min_h(rem(28.))
         .px(px(8.))
         .gap(px(6.))
@@ -881,23 +895,32 @@ fn chat_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stat
         .text_size(rem(12.))
         .text_color(rgb(CHAT_MUTED))
         .cursor_pointer()
-        .hover(|s| s.bg(rgba(0xffffff0c)))
-        .active(|s| s.bg(rgba(0xffffff18)))
         .focus(|s| s.bg(rgba(0x4d6bfe30)))
-        .child(label.into())
 }
 
-fn chat_avatar(size: f32) -> Div {
-    row()
-        .size(px(size))
-        .justify_center()
+fn chat_avatar(size: f32) -> Avatar {
+    Avatar::new()
+        .name("M")
+        .with_size(px(size))
         .flex_shrink_0()
         .rounded(px(size * 0.3))
         .bg(rgb(0x4d6bfe))
         .text_color(rgb(0xffffff))
         .text_size(px(size * 0.55))
         .font_weight(FontWeight::SEMIBOLD)
-        .child("M")
+}
+
+fn chat_keycap(label: &str) -> Kbd {
+    let key = match label {
+        "Ctrl+N" if cfg!(target_os = "macos") => "cmd-n",
+        "Ctrl+N" => "ctrl-n",
+        "Esc" => "escape",
+        _ => label,
+    };
+    Kbd::new(super::parse_keystroke(key).expect("static chat shortcut"))
+        .appearance(false)
+        .text_color(rgb(CHAT_MUTED))
+        .text_size(rem(10.))
 }
 
 #[cfg(test)]

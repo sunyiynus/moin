@@ -6,15 +6,20 @@
 | --- | --- |
 | `mod.rs` | 主浮窗：`Moin` 视图、搜索框、结果列表、预览、操作菜单、底部状态栏、整体布局 |
 | `settings.rs` | 设置窗口：搜索、索引、AI、外观、插件、常规页面 |
-| `input.rs` | 自定义文本输入框：光标、选区、IME、绘制 |
+| `input.rs` | GPUI Kit `Input` / `Textarea` 状态适配：同步业务文本与功能入口按键 |
+| `ui.rs` | GPUI Kit 初始化、窗口主题作用域、独立 Kit Root 和业务窗口句柄 |
 | `appearance.rs` | 字体解析、rem 缩放、SVG 图标、资源加载 |
 | `icons.rs` | Windows 应用/文件系统图标提取（仅 Windows 编译） |
 | `launcher_window.rs` | 浮窗原生窗口：显示/隐藏、圆角、亚克力/毛玻璃 |
 | `chat/mod.rs` | AI 会话状态、任务控制、`AiPane` 的 `Render` 入口 |
 | `chat/view.rs` | AI 对话布局：会话侧栏、消息正文、输入区、底部栏、命令执行详情 |
-| `chat/markdown.rs` | AI 回复和设置预览使用的 Markdown 渲染 |
+| `chat/markdown.rs` | AI 回复和设置预览使用的 Markdown 渲染（GPUI Kit `TextView`） |
 | `platform/tray.rs` | Windows 托盘图标、托盘菜单和快捷键宿主 |
 | `platform/tray_macos.rs` | macOS 菜单栏图标和原生菜单 |
+
+通用 UI 控件使用 [longbridge/gpui-kit 0.10.0](https://github.com/longbridge/gpui-kit) 发布的能力；GPUI 核心由 Kit 固定的 `gpui-pre` 0.3.12 快照提供，并通过 `gpui` 别名保持现有导入路径。按钮、输入框、开关、单选项、列表、侧栏、分组、提示、快捷键标签、头像和折叠区域均由 Kit 组件提供。`div` 仅组织布局；截图选区/画笔使用专用渲染，Markdown 与长文本由 Kit 的 `TextView` 渲染。
+
+每个原生窗口都有独立的 Kit Root。业务层通过 `UiWindow<T>` 访问 Root 下面的视图，避免直接假定窗口根是 `Moin` 或 `AiPane`。浅色设置页与深色浮窗使用覆盖布局、预绘制、绘制三个阶段的主题作用域；退出作用域后恢复主题，避免 Kit 的全局主题影响另一个窗口。AI 会话仍只同步数据。
 
 ## 后端代码
 

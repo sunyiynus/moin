@@ -84,19 +84,7 @@ mod windows_icons {
     }
 
     pub fn get(source: Source, window: &mut Window, cx: &mut App) -> Option<Arc<RenderImage>> {
-        let (asset, first) = cx.fetch_asset::<ShellIcon>(&source);
-        if let Some(icon) = asset.peek() {
-            return icon.clone();
-        }
-        if first {
-            window
-                .spawn(cx, async move |cx| {
-                    asset.await;
-                    let _ = cx.update(|window, _| window.refresh());
-                })
-                .detach();
-        }
-        None
+        window.use_asset::<ShellIcon>(&source, cx).flatten()
     }
 
     struct ComApartment(bool);

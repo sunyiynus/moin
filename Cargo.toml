@@ -15,12 +15,15 @@ async-compression = { version = "=0.4.19", default-features = false }
 directories = "6"
 extism = { version = "=1.41.0", default-features = false }
 futures = "0.3"
-gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
-image = { version = "0.25", default-features = false }
+gif = { version = "=0.13.3", features = ["raii_no_panic"] }
+# GPUI Kit pins its GPUI core to the gpui-pre 0.3.12 snapshot and re-exports it.
+# Alias the same package as `gpui` so the existing `use gpui::...` paths stay compatible.
+gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, features = ["windows-manifest"] }
+gpui-kit = "0.10.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 lancedb = { version = "=0.23.1", default-features = false }
 meval = "0.2"
 plist = "1"
-pulldown-cmark = { version = "0.13.6", default-features = false }
 rig = { package = "rig-core", version = "=0.46.0", default-features = false, features = ["reqwest", "rustls"] }
 rig-agent = { version = "=0.46.0", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -33,10 +36,11 @@ url = "2"
 walkdir = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "=0.1.6"
 cocoa = "=0.26.0"
 fs2 = "0.4"
 global-hotkey = "0.8"
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, features = ["font-kit"] }
 objc = "0.2"
 raw-window-handle = "0.6"
 tray-icon = { version = "=0.26.1", default-features = false }
@@ -50,10 +54,13 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -68,6 +75,6 @@ debug = 0
 debug = 0
 
 [dev-dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, features = ["test-support"] }
 tempfile = "3"
 wat = "1"

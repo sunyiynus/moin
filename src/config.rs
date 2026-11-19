@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub everything: EverythingConfig,
     #[serde(default)]
+    pub capture: CaptureConfig,
+    #[serde(default)]
     pub ai: AiConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingConfig>,
@@ -37,6 +39,7 @@ impl Default for Config {
             recent_apps: Vec::new(),
             appearance: AppearanceConfig::default(),
             everything: EverythingConfig::default(),
+            capture: CaptureConfig::default(),
             ai: AiConfig::default(),
             embedding: None,
         }
@@ -101,6 +104,53 @@ impl Default for EverythingConfig {
     }
 }
 
+/// Capture files stay outside the application database and can be used directly.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CaptureConfig {
+    pub output_dir: PathBuf,
+    pub gif_fps: u16,
+    pub gif_max_seconds: u32,
+    pub include_cursor: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        let output_dir = directories::UserDirs::new()
+            .map(|dirs| dirs.picture_dir().unwrap_or(dirs.home_dir()).join("Moin"))
+            .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join("Moin")))
+            .unwrap_or_else(|| std::env::temp_dir().join("Moin Captures"));
+        Self {
+            output_dir,
+            gif_fps: 10,
+            gif_max_seconds: 60,
+            include_cursor: true,
+        }
+    }
+}
+
+impl CaptureConfig {
+    pub fn normalized(mut self) -> Self {
+        if self.output_dir.as_os_str().is_empty() {
+            self.output_dir = Self::default().output_dir;
+        }
+        self.gif_fps = self.gif_fps.clamp(1, 30);
+        self.gif_max_seconds = self.gif_max_seconds.clamp(1, 120);
+        self
+    }
+
+    /// Do not create folders until the first actual capture is saved.
+    pub fn validated(self) -> Result<Self> {
+        let config = self.normalized();
+        anyhow::ensure!(config.output_dir.is_absolute(), "保存目录需要使用完整路径");
+        anyhow::ensure!(
+            !config.output_dir.is_file(),
+            "保存目录指向了一个文件，请选择文件夹"
+        );
+        Ok(config)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -149,6 +199,7 @@ impl Config {
                 let mut config: Self = serde_json::from_str(text)
                     .with_context(|| format!("无法读取 {}", path.display()))?;
                 config.appearance = config.appearance.normalized();
+                config.capture = config.capture.normalized();
                 Ok(config)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -183,6 +234,7 @@ mod tests {
         assert!(config.feature_shortcuts.iter().next().is_none());
         assert_eq!(config.appearance, AppearanceConfig::default());
         assert!(config.everything.enabled);
+        assert_eq!(config.capture, CaptureConfig::default());
         config.activation_hotkey = "Ctrl+Shift+K".into();
         config
             .feature_shortcuts
@@ -190,6 +242,9 @@ mod tests {
         config.appearance.ui_font_size = 18.0;
         config.appearance.ai_font_family = "Microsoft YaHei UI".into();
         config.ai.model = "qwen2.5:3b".into();
+        config.capture.gif_fps = 15;
+        config.capture.gif_max_seconds = 30;
+        config.capture.include_cursor = false;
         config.embedding = Some(EmbeddingConfig {
             model: "bge-m3".into(),
             endpoint: default_embedding_endpoint(),
@@ -212,6 +267,9 @@ mod tests {
         assert_eq!(restored.appearance.ui_font_size, 18.0);
         assert_eq!(restored.appearance.ai_font_family, "Microsoft YaHei UI");
         assert_eq!(restored.ai.model, "qwen2.5:3b");
+        assert_eq!(restored.capture.gif_fps, 15);
+        assert_eq!(restored.capture.gif_max_seconds, 30);
+        assert!(!restored.capture.include_cursor);
         assert_eq!(
             restored
                 .embedding
@@ -238,5 +296,31 @@ mod tests {
         assert_eq!(appearance.ai_font_family, "PingFang SC");
         assert_eq!(appearance.ui_font_size, UI_FONT_SIZE_MAX);
         assert_eq!(appearance.ai_font_size, AI_FONT_SIZE_MIN);
+    }
+
+    #[test]
+    fn capture_settings_preserve_older_configs_and_bound_recording() {
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.capture, CaptureConfig::default());
+        let normalized = CaptureConfig {
+            output_dir: PathBuf::new(),
+            gif_fps: 0,
+            gif_max_seconds: u32::MAX,
+            include_cursor: false,
+        }
+        .normalized();
+        assert!(normalized.output_dir.is_absolute());
+        assert_eq!(normalized.gif_fps, 1);
+        assert_eq!(normalized.gif_max_seconds, 120);
+        assert!(!normalized.include_cursor);
+        assert!(
+            CaptureConfig {
+                output_dir: PathBuf::from("relative"),
+                ..normalized.clone()
+            }
+            .validated()
+            .is_err()
+        );
+        assert!(normalized.validated().is_ok());
     }
 }

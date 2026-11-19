@@ -5,15 +5,51 @@ mod plugins;
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext, Application, Bounds, WindowBackgroundAppearance, WindowBounds, WindowKind,
+    App, AppContext, Bounds, WindowBackgroundAppearance, WindowBounds, WindowKind,
     WindowOptions, px, size,
 };
 use moin::config;
 
 fn main() {
+    install_panic_hook();
     if let Err(error) = run() {
         report_error(&error);
     }
+}
+
+/// Windows GUI binaries have no console, so panics would otherwise abort silently.
+/// Keep an append-only report next to the app data for the next reproduction.
+fn install_panic_hook() {
+    let log_path = config::data_dir()
+        .map(|dir| dir.join("panic.log"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("moin-panic.log"));
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write as _;
+
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format!(
+            "==== panic ====\nthread: {:?}\nmessage: {info}\nlocation: {:?}\nbacktrace:\n{backtrace}\n",
+            std::thread::current().name(),
+            info.location(),
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Repeated crashes must not grow one file without bound.
+        const LIMIT: u64 = 1 << 20;
+        if std::fs::metadata(&log_path).is_ok_and(|meta| meta.len() > LIMIT) {
+            let _ = std::fs::rename(&log_path, log_path.with_extension("old.log"));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "{report}");
+        }
+        default_hook(info);
+    }));
 }
 
 fn report_error(error: &anyhow::Error) {
@@ -44,10 +80,10 @@ fn run() -> Result<()> {
     #[cfg(windows)]
     let tray_controller = _tray.controller();
     let plugins = plugins::Plugins::load(&home)?;
-    let application = Application::new().with_assets(app::appearance::Assets);
+    let application = gpui_kit::platform::application().with_assets(app::appearance::Assets);
     #[cfg(target_os = "macos")]
     let reopened = {
-        let window = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::WindowHandle<app::Moin>>));
+        let window = std::rc::Rc::new(std::cell::Cell::new(None::<app::ui::UiWindow<app::Moin>>));
         let handle = window.clone();
         application.on_reopen(move |cx| {
             if let Some(handle) = handle.get() {
@@ -57,6 +93,7 @@ fn run() -> Result<()> {
         window
     };
     application.run(move |cx: &mut App| {
+        app::ui::init(cx);
         // AppKit's menu bar and global shortcut APIs must be created on the main
         // thread after applicationDidFinishLaunching, which invokes this callback.
         #[cfg(target_os = "macos")]
@@ -97,7 +134,7 @@ fn run() -> Result<()> {
                         false
                     });
                 }
-                cx.new(|cx| {
+                let view = cx.new(|cx| {
                     app::Moin::new(
                         home,
                         config,
@@ -107,11 +144,13 @@ fn run() -> Result<()> {
                         window,
                         cx,
                     )
-                })
+                });
+                app::ui::root(view, window, cx)
             },
         );
         match window {
             Ok(window) => {
+                let window = app::ui::UiWindow::<app::Moin>::from_handle(window);
                 #[cfg(target_os = "macos")]
                 reopened.set(Some(window));
                 cx.activate(true);
