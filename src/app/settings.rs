@@ -211,7 +211,7 @@ pub struct Settings {
 }
 
 pub fn open(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
-    open_page(launcher, Page::Mihomo, cx)
+    open_page(launcher, Page::App, cx)
 }
 
 pub fn open_ai(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
@@ -2119,6 +2119,7 @@ fn card() -> Div {
         .rounded(px(5.))
 }
 
+#[track_caller]
 fn section(label: &'static str) -> GroupBox {
     GroupBox::new()
         .id(SharedString::from(format!("settings-section-{label}")))
@@ -2128,6 +2129,7 @@ fn section(label: &'static str) -> GroupBox {
         .gap(px(8.))
 }
 
+#[track_caller]
 fn setting_row(
     glyph: &'static str,
     label: impl Into<SharedString>,
@@ -2159,26 +2161,45 @@ fn setting_row(
         )
 }
 
+#[track_caller]
 fn title(text: impl Into<SharedString>, size: f32) -> Label {
     let text = text.into();
     // GPUI keys a component's accessibility node by its whole id path, and
-    // `Label::new` only sees this helper as the call site. Every label built here
-    // would therefore share one element id and trip the duplicate-node assertion
-    // once accessibility is active, so name each label after what it shows.
+    // `Label::new` only sees this helper as the call site. Include the caller's
+    // source position so two labels with the same text (for example a section
+    // title and an input label named "控制器") remain distinct nodes.
+    let position = std::panic::Location::caller();
+    let id = SharedString::from(format!(
+        "settings-title:{}:{}:{}:{}",
+        text,
+        position.file(),
+        position.line(),
+        position.column()
+    ));
     Label::new(text.clone())
-        .id((ElementId::from("settings-title"), text))
+        .id(id)
         .text_size(rem(size))
         .font_weight(FontWeight::SEMIBOLD)
 }
+#[track_caller]
 fn description(text: impl Into<SharedString>) -> Label {
     let text = text.into();
+    let position = std::panic::Location::caller();
+    let id = SharedString::from(format!(
+        "settings-description:{}:{}:{}:{}",
+        text,
+        position.file(),
+        position.line(),
+        position.column()
+    ));
     Label::new(text.clone())
-        .id((ElementId::from("settings-description"), text))
+        .id(id)
         .text_size(rem(13.))
         .line_height(rem(21.))
         .text_color(rgb(MUTED))
 }
 
+#[track_caller]
 fn input_field(
     id: &'static str,
     label: &'static str,
