@@ -183,6 +183,8 @@ pub struct Moin {
     tray_controller: platform::tray::TrayController,
     scroll: ScrollHandle,
     search_task: Option<Task<()>>,
+    launcher_active: bool,
+    _activation: Subscription,
     _subscription: Subscription,
 }
 
@@ -229,6 +231,11 @@ impl Moin {
             ai_error.clone(),
             home.join("index.sqlite3"),
         );
+        // A global popup must not linger over whatever the user switched to; the
+        // query, mode and AI session stay alive so the next summon resumes them.
+        let activation = cx.observe_window_activation(window, |view, window, _| {
+            view.launcher_activation_changed(window);
+        });
         let mut this = Self {
             db: home.join("index.sqlite3"),
             home,
@@ -275,6 +282,8 @@ impl Moin {
             tray_controller,
             scroll: ScrollHandle::new(),
             search_task: None,
+            launcher_active: window.is_window_active(),
+            _activation: activation,
             _subscription: subscription,
         };
         this.update_index(false, cx);
@@ -1248,6 +1257,20 @@ impl Moin {
         self.set_mode(SearchMode::All, window, cx);
         self.input.update(cx, |input, cx| input.clear(cx));
         self.set_ai(true, window, cx);
+    }
+
+    /// Hides the floating launcher as soon as another window takes focus.
+    ///
+    /// Only a real active -> inactive transition counts, so creating or restoring
+    /// the window never hides it, and the native folder picker (a step of the
+    /// launcher's own flow) keeps it open.
+    fn launcher_activation_changed(&mut self, window: &mut Window) {
+        let active = window.is_window_active();
+        let was_active = std::mem::replace(&mut self.launcher_active, active);
+        if active || !was_active || self.folder_picker_open {
+            return;
+        }
+        launcher_window::hide(window);
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
