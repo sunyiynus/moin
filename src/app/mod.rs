@@ -28,7 +28,7 @@ use gpui_kit::component::{
     tag::Tag,
 };
 use moin::{
-    config::{AppearanceConfig, Config, RecentApp},
+    config::{AppearanceConfig, Config, MihomoConfig, RecentApp},
     search::index::{self, Hit, HitKind, IndexSummary, SearchMode},
 };
 use std::{
@@ -177,6 +177,8 @@ pub struct Moin {
     active_hotkey: Option<String>,
     hotkey_busy: bool,
     hotkey_error: Option<String>,
+    mihomo: moin::mihomo::MihomoService,
+    mihomo_error: Option<String>,
     feature_shortcuts_busy: bool,
     feature_shortcuts_error: Option<String>,
     #[cfg(any(windows, target_os = "macos"))]
@@ -231,6 +233,7 @@ impl Moin {
             ai_error.clone(),
             home.join("index.sqlite3"),
         );
+        let mihomo = moin::mihomo::MihomoService::new(home.join("mihomo"));
         // A global popup must not linger over whatever the user switched to; the
         // query, mode and AI session stay alive so the next summon resumes them.
         let activation = cx.observe_window_activation(window, |view, window, _| {
@@ -276,6 +279,8 @@ impl Moin {
             active_hotkey: None,
             hotkey_busy: false,
             hotkey_error: None,
+            mihomo,
+            mihomo_error: None,
             feature_shortcuts_busy: false,
             feature_shortcuts_error: None,
             #[cfg(any(windows, target_os = "macos"))]
@@ -289,6 +294,13 @@ impl Moin {
         this.update_index(false, cx);
         this.refresh_everything_status(cx);
         this.configure_feature_shortcuts(this.config.feature_shortcuts.clone(), false, cx);
+        if this.config.mihomo.auto_start && this.config.mihomo.configured() {
+            this.mihomo_error = this
+                .mihomo
+                .start(this.config.mihomo.clone())
+                .err()
+                .map(|error| format!("无法启动 mihomo 核心 · {error:#}"));
+        }
         this
     }
 
@@ -581,6 +593,66 @@ impl Moin {
         Ok(())
     }
 
+    pub fn save_mihomo_config(
+        &mut self,
+        mihomo: MihomoConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let mihomo = mihomo.normalized();
+        mihomo.validate_controller()?;
+        let mut config = self.config.clone();
+        config.mihomo = mihomo;
+        config.save(&self.home)?;
+        self.config = config;
+        self.mihomo_error = None;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn start_mihomo(&mut self, cx: &mut Context<Self>) {
+        self.mihomo_error = self
+            .mihomo
+            .start(self.config.mihomo.clone())
+            .err()
+            .map(|error| format!("无法启动 mihomo 核心 · {error:#}"));
+        cx.notify();
+    }
+
+    pub fn stop_mihomo(&mut self, cx: &mut Context<Self>) {
+        self.mihomo_error = self
+            .mihomo
+            .stop()
+            .err()
+            .map(|error| format!("无法停止 mihomo 核心 · {error:#}"));
+        cx.notify();
+    }
+
+    pub fn reload_mihomo(&mut self, cx: &mut Context<Self>) {
+        self.mihomo_error = self
+            .mihomo
+            .reload()
+            .err()
+            .map(|error| format!("无法重新加载 mihomo 配置 · {error:#}"));
+        cx.notify();
+    }
+
+    pub fn refresh_mihomo(&mut self, cx: &mut Context<Self>) {
+        self.mihomo_error = self
+            .mihomo
+            .refresh()
+            .err()
+            .map(|error| format!("无法刷新 mihomo 状态 · {error:#}"));
+        cx.notify();
+    }
+
+    pub fn shutdown_mihomo(&mut self) {
+        self.mihomo.shutdown();
+    }
+
+    pub fn subscribe_mihomo(&self) -> tokio::sync::watch::Receiver<moin::mihomo::MihomoState> {
+        self.mihomo.subscribe()
+    }
+
     pub fn settings_snapshot(&self) -> settings::Snapshot {
         settings::Snapshot {
             roots: self.config.roots.clone(),
@@ -614,6 +686,9 @@ impl Moin {
             appearance: self.config.appearance.clone(),
             capture: self.config.capture.clone(),
             capture_error: None,
+            mihomo: self.config.mihomo.clone(),
+            mihomo_state: self.mihomo.state(),
+            mihomo_error: self.mihomo_error.clone(),
             everything_enabled: self.config.everything.enabled,
             everything_status: self.everything_status.clone(),
             everything_error: self.everything_error.clone(),
@@ -2557,6 +2632,7 @@ pub fn listen_to_tray(
         while let Ok(event) = receiver.recv().await {
             let result = match event {
                 TrayEvent::Quit => {
+                    let _ = handle.update(cx, |view, _, _| view.shutdown_mihomo());
                     let _ = cx.update(|app| app.quit());
                     return;
                 }
@@ -2615,6 +2691,7 @@ pub fn listen_to_tray(
                 break;
             }
         }
+        let _ = handle.update(cx, |view, _, _| view.shutdown_mihomo());
         let _ = cx.update(|app| app.quit());
     })
     .detach();

@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub capture: CaptureConfig,
     #[serde(default)]
+    pub mihomo: MihomoConfig,
+    #[serde(default)]
     pub ai: AiConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<EmbeddingConfig>,
@@ -40,6 +42,7 @@ impl Default for Config {
             appearance: AppearanceConfig::default(),
             everything: EverythingConfig::default(),
             capture: CaptureConfig::default(),
+            mihomo: MihomoConfig::default(),
             ai: AiConfig::default(),
             embedding: None,
         }
@@ -151,6 +154,90 @@ impl CaptureConfig {
     }
 }
 
+/// mihomo (Clash.Meta) 核心由 Moin 启动，并通过本机 loopback 控制器管理。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MihomoConfig {
+    /// 随 Moin 启动核心；手动启动不受此开关影响。
+    pub auto_start: bool,
+    /// mihomo 可执行文件的完整路径。
+    pub binary_path: PathBuf,
+    /// mihomo 配置文档（YAML）的完整路径。
+    pub config_path: PathBuf,
+    /// 控制器端点，只接受 `http://` + IP 字面量的 loopback 地址。
+    pub controller: String,
+    /// 控制器 bearer secret；空字符串表示不鉴权。
+    pub secret: String,
+}
+
+impl Default for MihomoConfig {
+    fn default() -> Self {
+        Self {
+            auto_start: false,
+            binary_path: PathBuf::new(),
+            config_path: PathBuf::new(),
+            controller: "http://127.0.0.1:9090".into(),
+            secret: String::new(),
+        }
+    }
+}
+
+impl MihomoConfig {
+    pub fn normalized(mut self) -> Self {
+        self.controller = self.controller.trim().to_owned();
+        self.secret = self.secret.trim().to_owned();
+        self
+    }
+
+    /// 两条核心路径都已填写，可以尝试启动。
+    pub fn configured(&self) -> bool {
+        !self.binary_path.as_os_str().is_empty() && !self.config_path.as_os_str().is_empty()
+    }
+
+    pub fn secret(&self) -> Option<String> {
+        (!self.secret.is_empty()).then(|| self.secret.clone())
+    }
+
+    /// 控制器地址由驱动校验：只允许明文 HTTP 的 loopback IP 与显式端口。
+    pub fn validate_controller(&self) -> Result<()> {
+        mihomo_driver::api::client::MihomoClient::new(&self.controller, self.secret())
+            .map(|_| ())
+            .with_context(|| format!("mihomo 控制器地址无效：{}", self.controller))
+    }
+
+    /// 启动前的完整校验。保存设置时只校验控制器地址，允许暂时留空核心路径。
+    pub fn validate_for_start(&self) -> Result<()> {
+        self.validate_controller()?;
+        anyhow::ensure!(
+            !self.binary_path.as_os_str().is_empty(),
+            "请选择 mihomo 可执行文件"
+        );
+        anyhow::ensure!(
+            !self.config_path.as_os_str().is_empty(),
+            "请选择 mihomo 配置文件"
+        );
+        anyhow::ensure!(
+            self.binary_path.is_absolute(),
+            "mihomo 可执行文件需要使用完整路径"
+        );
+        anyhow::ensure!(
+            self.config_path.is_absolute(),
+            "mihomo 配置文件需要使用完整路径"
+        );
+        anyhow::ensure!(
+            self.binary_path.is_file(),
+            "找不到 mihomo 可执行文件：{}",
+            self.binary_path.display()
+        );
+        anyhow::ensure!(
+            self.config_path.is_file(),
+            "找不到 mihomo 配置文件：{}",
+            self.config_path.display()
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -200,6 +287,7 @@ impl Config {
                     .with_context(|| format!("无法读取 {}", path.display()))?;
                 config.appearance = config.appearance.normalized();
                 config.capture = config.capture.normalized();
+                config.mihomo = config.mihomo.normalized();
                 Ok(config)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -245,6 +333,13 @@ mod tests {
         config.capture.gif_fps = 15;
         config.capture.gif_max_seconds = 30;
         config.capture.include_cursor = false;
+        config.mihomo = MihomoConfig {
+            auto_start: true,
+            binary_path: PathBuf::from("C:\\Tools\\mihomo.exe"),
+            config_path: PathBuf::from("C:\\Tools\\config.yaml"),
+            controller: " http://127.0.0.1:9091 ".into(),
+            secret: " let-me-in ".into(),
+        };
         config.embedding = Some(EmbeddingConfig {
             model: "bge-m3".into(),
             endpoint: default_embedding_endpoint(),
@@ -270,6 +365,13 @@ mod tests {
         assert_eq!(restored.capture.gif_fps, 15);
         assert_eq!(restored.capture.gif_max_seconds, 30);
         assert!(!restored.capture.include_cursor);
+        assert!(restored.mihomo.auto_start);
+        assert_eq!(restored.mihomo.controller, "http://127.0.0.1:9091");
+        assert_eq!(restored.mihomo.secret, "let-me-in");
+        assert_eq!(
+            restored.mihomo.binary_path,
+            PathBuf::from("C:\\Tools\\mihomo.exe")
+        );
         assert_eq!(
             restored
                 .embedding
@@ -299,9 +401,58 @@ mod tests {
     }
 
     #[test]
+    fn mihomo_settings_validate_paths_and_loopback_controller() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let binary = folder.path().join("mihomo.exe");
+        let config = folder.path().join("config.yaml");
+        fs::write(&binary, b"")?;
+        fs::write(&config, b"mode: rule\n")?;
+
+        let valid = MihomoConfig {
+            binary_path: binary.clone(),
+            config_path: config.clone(),
+            ..MihomoConfig::default()
+        };
+        assert!(valid.validate_for_start().is_ok());
+        assert!(valid.configured());
+        assert!(valid.secret().is_none());
+
+        let missing = MihomoConfig {
+            binary_path: folder.path().join("missing.exe"),
+            ..valid.clone()
+        };
+        assert!(missing.validate_for_start().is_err());
+
+        let remote = MihomoConfig {
+            controller: "https://localhost:9090".into(),
+            ..valid.clone()
+        };
+        assert!(remote.validate_controller().is_err());
+
+        assert!(
+            MihomoConfig {
+                binary_path: PathBuf::new(),
+                ..valid.clone()
+            }
+            .validate_for_start()
+            .is_err()
+        );
+        assert!(
+            MihomoConfig {
+                config_path: PathBuf::from("relative.yaml"),
+                ..valid
+            }
+            .validate_for_start()
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn capture_settings_preserve_older_configs_and_bound_recording() {
         let legacy: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.capture, CaptureConfig::default());
+        assert_eq!(legacy.mihomo, MihomoConfig::default());
         let normalized = CaptureConfig {
             output_dir: PathBuf::new(),
             gif_fps: 0,

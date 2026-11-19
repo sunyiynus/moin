@@ -109,13 +109,33 @@ Windows 使用原生 GDI 截图，录制控制条排除在画面之外。macOS 1
 
 设置窗口采用 Windows Command Palette 风格：左侧分类导航，右侧按功能分组的设置项。激活快捷键在「常规」中配置；文件名搜索、正文索引、AI 模型、字体和插件各有独立页面。
 
-所有界面设置统一保存在数据目录的 `settings.json`，包括索引目录、快捷键、外观、Everything、AI 和可选的嵌入模型参数。
+所有界面设置统一保存在数据目录的 `settings.json`，包括索引目录、快捷键、外观、Everything、AI、mihomo 代理和可选的嵌入模型参数。
 
 AI 界面左侧支持多个会话，可新建、切换和删除；各会话有独立上下文和任务。点击设置右侧的「单独窗口」可把对话打开为普通窗口，与浮窗同步会话记录和回复。两边使用独立的 GPUI 视图、输入框和布局，草稿、会话选择、展开状态和滚动位置互不影响。两个窗口均使用透明亚克力背景；会话只在本次运行中保留。
 
 在「设置 → AI 助手 → 任务执行」启用「允许执行本机命令」后，Agent 可以执行 PowerShell 命令和脚本，读取退出码与输出并继续任务。macOS 默认使用 sh。支持配置工作目录，对话显示执行记录，停止生成会结束命令及其子进程。需要支持工具调用的模型，详细行为见 [AI 对话说明](docs/AI.md)。
 
 可以选择允许 Agent 调用本地文档检索工具，复用现有 LanceDB 索引并显示来源。此选项默认关闭；启用后，检索片段会发送给所选模型服务。聊天只保存在当前进程内存中，API Key 从配置的环境变量读取。具体配置及使用方法见 [AI 对话说明](docs/AI.md)。
+
+## mihomo 代理核心
+
+Moin 可以托管本机 [mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta) 核心。在「设置 → mihomo 代理」中选择可执行文件与 YAML 配置、填写 loopback 控制器地址并保存，即可启动、停止和重新加载核心；状态卡片显示核心版本、PID 和日志位置。
+
+核心由 [`mihomo-driver`](https://crates.io/crates/mihomo-driver) 启动，命令行为 `mihomo -d <配置目录> -f <配置文件>`，PID 记录保存在数据目录的 `mihomo/mihomo.pid`，输出写入 `mihomo/logs/mihomo.log`。打开「随 Moin 启动」后，下次启动 Moin 会按已保存的设置自动拉起核心；退出 Moin 时会尝试停止核心。
+
+控制器只接受 `http://` + `127.0.0.0/8` 或 `::1` 字面量和显式端口，例如 `http://127.0.0.1:9090`。设置统一保存在 `settings.json` 的 `mihomo` 字段：
+
+```json
+"mihomo": {
+  "auto_start": false,
+  "binary_path": "C:\\Tools\\mihomo\\mihomo.exe",
+  "config_path": "C:\\Tools\\mihomo\\config.yaml",
+  "controller": "http://127.0.0.1:9090",
+  "secret": ""
+}
+```
+
+`secret` 为空时不发送 bearer 鉴权；它会和其余设置一样以明文保存在本机 `settings.json`。
 
 ## 文件名搜索与 Everything
 

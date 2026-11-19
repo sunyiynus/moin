@@ -24,10 +24,11 @@ use moin::search::everything;
 use moin::{
     ai::{AiConfig, AiProvider},
     config::{
-        AI_FONT_SIZE_MAX, AI_FONT_SIZE_MIN, AppearanceConfig, CaptureConfig, UI_FONT_SIZE_MAX,
-        UI_FONT_SIZE_MIN,
+        AI_FONT_SIZE_MAX, AI_FONT_SIZE_MIN, AppearanceConfig, CaptureConfig, MihomoConfig,
+        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN,
     },
     hotkey::{self, FeatureAction, FeatureShortcuts, Shortcut},
+    mihomo::{MihomoState, MihomoStatus},
 };
 
 // Fluent settings: a quiet navigation surface, white setting rows and one accent.
@@ -88,6 +89,9 @@ pub struct Snapshot {
     pub everything_error: Option<String>,
     pub capture: CaptureConfig,
     pub capture_error: Option<String>,
+    pub mihomo: MihomoConfig,
+    pub mihomo_state: MihomoState,
+    pub mihomo_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,6 +104,7 @@ enum Page {
     App,
     Shortcuts,
     Capture,
+    Mihomo,
 }
 
 impl Page {
@@ -113,6 +118,7 @@ impl Page {
             Self::App => "常规",
             Self::Shortcuts => "快捷键",
             Self::Capture => "截图与录制",
+            Self::Mihomo => "mihomo 代理",
         }
     }
 
@@ -132,6 +138,7 @@ impl Page {
             Self::App => "设置 Moin 的激活快捷键，查看应用信息。",
             Self::Shortcuts => "为各功能分配全局快捷键，直接唤起浮窗并进入对应功能。",
             Self::Capture => "框选屏幕截图、贴图，或将选定区域录制为 GIF 动图。",
+            Self::Mihomo => "启动本机 mihomo (Clash.Meta) 核心，并读取控制器运行状态。",
         }
     }
 
@@ -145,6 +152,7 @@ impl Page {
             Self::App => "\u{e713}",
             Self::Shortcuts => "\u{e765}",
             Self::Capture => "\u{e722}",
+            Self::Mihomo => "\u{e774}",
         }
     }
 }
@@ -153,6 +161,12 @@ impl Page {
 enum FontTarget {
     Ui,
     Ai,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MihomoTarget {
+    Binary,
+    Config,
 }
 
 pub struct Settings {
@@ -185,12 +199,19 @@ pub struct Settings {
     capture_cursor: bool,
     capture_picker_open: bool,
     capture_error: Option<String>,
+    mihomo_binary: Entity<SearchInput>,
+    mihomo_config: Entity<SearchInput>,
+    mihomo_controller: Entity<SearchInput>,
+    mihomo_secret: Entity<SearchInput>,
+    mihomo_auto_start: bool,
+    mihomo_picker: Option<MihomoTarget>,
+    mihomo_error: Option<String>,
     _field_subscriptions: Vec<Subscription>,
     _subscription: Subscription,
 }
 
 pub fn open(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
-    open_page(launcher, Page::App, cx)
+    open_page(launcher, Page::Mihomo, cx)
 }
 
 pub fn open_ai(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
@@ -234,6 +255,16 @@ fn open_page(
                 let config = snapshot.ai_config;
                 let appearance = snapshot.appearance;
                 let capture = snapshot.capture;
+                let mihomo = snapshot.mihomo;
+                let mut mihomo_states = launcher.read(cx).subscribe_mihomo();
+                cx.spawn(async move |view, cx| {
+                    while mihomo_states.changed().await.is_ok() {
+                        if view.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
                 let ai_base_url = cx.new(|cx| SearchInput::field(&config.base_url, "服务地址", cx));
                 let ai_model = cx.new(|cx| {
                     SearchInput::field(&config.model, "填写已安装或服务支持的模型名称", cx)
@@ -252,6 +283,25 @@ fn open_page(
                 });
                 let ai_system_prompt = cx.new(|cx| {
                     SearchInput::field(&config.system_prompt, "可选，使用 Moin 默认角色", cx)
+                });
+                let mihomo_binary = cx.new(|cx| {
+                    SearchInput::field(
+                        mihomo.binary_path.to_string_lossy().as_ref(),
+                        "选择 mihomo 可执行文件",
+                        cx,
+                    )
+                });
+                let mihomo_config = cx.new(|cx| {
+                    SearchInput::field(
+                        mihomo.config_path.to_string_lossy().as_ref(),
+                        "选择 mihomo 配置（YAML）",
+                        cx,
+                    )
+                });
+                let mihomo_controller = cx
+                    .new(|cx| SearchInput::field(&mihomo.controller, "http://127.0.0.1:9090", cx));
+                let mihomo_secret = cx.new(|cx| {
+                    SearchInput::field(&mihomo.secret, "留空表示控制器未设置 secret", cx)
                 });
                 let ui_font_family = cx.new(|cx| {
                     SearchInput::field(&appearance.ui_font_family, "留空使用系统字体", cx)
@@ -276,11 +326,19 @@ fn open_page(
                 .collect();
                 let mut subscriptions = subscriptions;
                 subscriptions.extend(
-                    [&ui_font_family, &ai_font_family, &capture_directory]
-                        .into_iter()
-                        .map(|field| {
-                            cx.subscribe(field, |_: &mut Settings, _, _: &Changed, cx| cx.notify())
-                        }),
+                    [
+                        &ui_font_family,
+                        &ai_font_family,
+                        &capture_directory,
+                        &mihomo_binary,
+                        &mihomo_config,
+                        &mihomo_controller,
+                        &mihomo_secret,
+                    ]
+                    .into_iter()
+                    .map(|field| {
+                        cx.subscribe(field, |_: &mut Settings, _, _: &Changed, cx| cx.notify())
+                    }),
                 );
                 Settings {
                     hotkey_draft: snapshot.activation_hotkey,
@@ -313,6 +371,13 @@ fn open_page(
                     capture_cursor: capture.include_cursor,
                     capture_picker_open: false,
                     capture_error: None,
+                    mihomo_binary,
+                    mihomo_config,
+                    mihomo_controller,
+                    mihomo_secret,
+                    mihomo_auto_start: mihomo.auto_start,
+                    mihomo_picker: None,
+                    mihomo_error: None,
                     _field_subscriptions: subscriptions,
                     _subscription: cx.observe(&launcher, |_, _, cx| cx.notify()),
                     launcher,
@@ -339,6 +404,7 @@ impl Render for Settings {
             Page::App => self.app_page(snapshot, cx),
             Page::Shortcuts => self.shortcuts_page(snapshot, cx),
             Page::Capture => self.capture_page(snapshot, cx),
+            Page::Mihomo => self.mihomo_page(snapshot, cx),
         };
         let tree = div()
             .size_full()
@@ -446,6 +512,7 @@ impl Settings {
                         Page::Search,
                         Page::Index,
                         Page::Ai,
+                        Page::Mihomo,
                         Page::Capture,
                         Page::Plugins,
                     ]
@@ -1315,6 +1382,382 @@ impl Settings {
         cx.notify();
     }
 
+    fn mihomo_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
+        let draft = self.mihomo_draft(cx);
+        let dirty = draft != snapshot.mihomo;
+        let busy = snapshot.mihomo_state.status.is_busy();
+        let running = snapshot.mihomo_state.status.is_running();
+        let picking = self.mihomo_picker.is_some();
+        let can_start = !busy && !dirty && !picking && snapshot.mihomo.configured();
+        let can_save = !busy && !picking && dirty;
+        let (status, status_color) = mihomo_status_label(&snapshot.mihomo_state);
+        let log_dir = snapshot.data_dir.join("mihomo").join("logs");
+        let log_hint = log_dir.to_string_lossy().into_owned();
+        let error = snapshot
+            .mihomo_error
+            .clone()
+            .or(snapshot.mihomo_state.error.clone());
+        let notice = snapshot.mihomo_state.notice.clone();
+
+        column()
+            .gap(px(24.))
+            .child(
+                section("核心状态")
+                    .child(
+                        card()
+                            .gap(px(12.))
+                            .px(px(20.))
+                            .py(px(16.))
+                            .child(
+                                row()
+                                    .flex_wrap()
+                                    .justify_between()
+                                    .gap(px(16.))
+                                    .child(
+                                        column().flex_1().min_w(px(220.)).gap(px(4.)).child(
+                                            Label::new(status.clone())
+                                                .id((ElementId::from("mihomo-status"), status))
+                                                .text_size(rem(14.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(status_color)),
+                                        )
+                                        .child(description(mihomo_status_detail(&snapshot))),
+                                    )
+                                    .child(
+                                        row()
+                                            .flex_wrap()
+                                            .gap(px(8.))
+                                            .child(
+                                                button(
+                                                    "start-mihomo",
+                                                    if running { "重启核心" } else { "启动核心" },
+                                                    true,
+                                                    can_start,
+                                                )
+                                                    .when(can_start, |control| {
+                                                        control.on_click(cx.listener(
+                                                            |view, _, _, cx| {
+                                                                view.mihomo_error = None;
+                                                                view.launcher.update(
+                                                                    cx,
+                                                                    |launcher, cx| {
+                                                                        launcher
+                                                                            .start_mihomo(cx)
+                                                                    },
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    }),
+                                            )
+                                            .child(
+                                                button(
+                                                    "stop-mihomo",
+                                                    "停止核心",
+                                                    false,
+                                                    running && !busy,
+                                                )
+                                                .when(running && !busy, |control| {
+                                                    control.on_click(cx.listener(
+                                                        |view, _, _, cx| {
+                                                            view.mihomo_error = None;
+                                                            view.launcher.update(
+                                                                cx,
+                                                                |launcher, cx| {
+                                                                    launcher.stop_mihomo(cx)
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                }),
+                                            )
+                                            .child(
+                                                button(
+                                                    "reload-mihomo",
+                                                    "重新加载配置",
+                                                    false,
+                                                    running && !busy,
+                                                )
+                                                .when(running && !busy, |control| {
+                                                    control.on_click(cx.listener(
+                                                        |view, _, _, cx| {
+                                                            view.mihomo_error = None;
+                                                            view.launcher.update(
+                                                                cx,
+                                                                |launcher, cx| {
+                                                                    launcher.reload_mihomo(cx)
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                }),
+                                            )
+                                            .child(
+                                                button("refresh-mihomo", "刷新状态", false, !busy)
+                                                    .when(!busy, |control| {
+                                                        control.on_click(cx.listener(
+                                                            |view, _, _, cx| {
+                                                                view.mihomo_error = None;
+                                                                view.launcher.update(
+                                                                    cx,
+                                                                    |launcher, cx| {
+                                                                        launcher
+                                                                            .refresh_mihomo(cx)
+                                                                    },
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    }),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                row()
+                                    .flex_wrap()
+                                    .gap(px(8.))
+                                    .child(
+                                        button("open-mihomo-logs", "打开日志目录", false, true)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = std::fs::create_dir_all(&log_dir);
+                                                cx.open_with_system(&log_dir);
+                                            }),
+                                    )
+                                    .child(description(format!("日志：{log_hint}"))),
+                            )
+                            .when_some(error, |card, error| card.child(error_message(error)))
+                            .when_some(notice, |card, notice| card.child(description(notice))),
+                    )
+                    .when(dirty, |section| {
+                        section.child(description("有未保存的修改；启动核心使用已保存的设置。"))
+                    }),
+            )
+            .child(
+                section("核心文件")
+                    .child(input_field(
+                        "mihomo-binary-path",
+                        "可执行文件",
+                        &self.mihomo_binary,
+                        cx,
+                    ))
+                    .child(
+                        row().gap(px(8.)).child(
+                            button(
+                                "choose-mihomo-binary",
+                                if self.mihomo_picker == Some(MihomoTarget::Binary) {
+                                    "正在选择…"
+                                } else {
+                                    "选择 mihomo 可执行文件"
+                                },
+                                false,
+                                !picking,
+                            )
+                            .when(!picking, |control| {
+                                control.on_click(cx.listener(|view, _, _, cx| {
+                                    view.choose_mihomo_file(MihomoTarget::Binary, cx)
+                                }))
+                            }),
+                        ),
+                    )
+                    .child(input_field(
+                        "mihomo-config-path",
+                        "配置文件",
+                        &self.mihomo_config,
+                        cx,
+                    ))
+                    .child(
+                        row().gap(px(8.)).child(
+                            button(
+                                "choose-mihomo-config",
+                                if self.mihomo_picker == Some(MihomoTarget::Config) {
+                                    "正在选择…"
+                                } else {
+                                    "选择 mihomo 配置文件"
+                                },
+                                false,
+                                !picking,
+                            )
+                            .when(!picking, |control| {
+                                control.on_click(cx.listener(|view, _, _, cx| {
+                                    view.choose_mihomo_file(MihomoTarget::Config, cx)
+                                }))
+                            }),
+                        ),
+                    )
+                    .child(description(
+                        "Moin 使用 mihomo -d <配置目录> -f <配置文件> 启动核心；PID 与日志保存在数据目录的 mihomo 文件夹。",
+                    )),
+            )
+            .child(
+                section("控制器")
+                    .child(input_field(
+                        "mihomo-controller",
+                        "控制器",
+                        &self.mihomo_controller,
+                        cx,
+                    ))
+                    .child(input_field(
+                        "mihomo-secret",
+                        "Secret",
+                        &self.mihomo_secret,
+                        cx,
+                    ))
+                    .child(description(
+                        "只接受 http:// 的 loopback IP 与显式端口，例如 http://127.0.0.1:9090。Secret 与其余设置一起明文保存在 settings.json。",
+                    )),
+            )
+            .child(
+                section("启动行为").child(
+                    setting_row(
+                        "\u{e713}",
+                        "随 Moin 启动",
+                        "下次启动 Moin 时自动拉起核心；路径为空时不会尝试。",
+                    )
+                    .child(
+                        Switch::new("mihomo-auto-start")
+                            .checked(self.mihomo_auto_start)
+                            .on_click(cx.listener(|view, checked: &bool, _, cx| {
+                                view.mihomo_auto_start = *checked;
+                                view.mihomo_error = None;
+                                cx.notify();
+                            })),
+                    ),
+                ),
+            )
+            .child(
+                column()
+                    .gap(px(10.))
+                    .child(
+                        row()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(
+                                button("save-mihomo-config", "保存 mihomo 设置", true, can_save)
+                                    .when(can_save, |control| {
+                                        control.on_click(cx.listener(|view, _, _, cx| {
+                                            view.save_mihomo_draft(cx)
+                                        }))
+                                    }),
+                            )
+                            .child(
+                                button("restore-mihomo-config", "还原已保存设置", false, can_save)
+                                    .when(can_save, |control| {
+                                        control.on_click(cx.listener(|view, _, _, cx| {
+                                            view.restore_mihomo_draft(cx)
+                                        }))
+                                    }),
+                            ),
+                    )
+                    .when(dirty, |section| {
+                        section.child(description("有未保存的修改。"))
+                    })
+                    .children(self.mihomo_error.clone().into_iter().map(error_message)),
+            )
+    }
+
+    fn mihomo_draft(&self, cx: &App) -> MihomoConfig {
+        MihomoConfig {
+            auto_start: self.mihomo_auto_start,
+            binary_path: PathBuf::from(self.mihomo_binary.read(cx).value().trim()),
+            config_path: PathBuf::from(self.mihomo_config.read(cx).value().trim()),
+            controller: self.mihomo_controller.read(cx).value().trim().to_owned(),
+            secret: self.mihomo_secret.read(cx).value().trim().to_owned(),
+        }
+        .normalized()
+    }
+
+    fn choose_mihomo_file(&mut self, target: MihomoTarget, cx: &mut Context<Self>) {
+        if self.mihomo_picker.is_some() {
+            return;
+        }
+        self.mihomo_picker = Some(target);
+        self.mihomo_error = None;
+        let prompt = match target {
+            MihomoTarget::Binary => "选择 mihomo 可执行文件",
+            MihomoTarget::Config => "选择 mihomo 配置文件",
+        };
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(prompt.into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let result = picker.await;
+            let _ = view.update(cx, |view, cx| {
+                view.mihomo_picker = None;
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            let input = match target {
+                                MihomoTarget::Binary => &view.mihomo_binary,
+                                MihomoTarget::Config => &view.mihomo_config,
+                            };
+                            input.update(cx, |input, cx| {
+                                input.set_value(path.to_string_lossy().into_owned(), cx);
+                            });
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        view.mihomo_error = Some(format!("无法选择 mihomo 文件 · {error:#}"))
+                    }
+                    Err(_) => view.mihomo_error = Some("文件选择器已关闭".into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_mihomo_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self.mihomo_draft(cx);
+        let result = self.launcher.update(cx, |launcher, cx| {
+            launcher.save_mihomo_config(draft.clone(), cx)
+        });
+        match result {
+            Ok(()) => {
+                self.mihomo_binary.update(cx, |input, cx| {
+                    input.set_value(draft.binary_path.to_string_lossy().into_owned(), cx);
+                });
+                self.mihomo_config.update(cx, |input, cx| {
+                    input.set_value(draft.config_path.to_string_lossy().into_owned(), cx);
+                });
+                self.mihomo_controller.update(cx, |input, cx| {
+                    input.set_value(draft.controller.clone(), cx);
+                });
+                self.mihomo_secret.update(cx, |input, cx| {
+                    input.set_value(draft.secret.clone(), cx);
+                });
+                self.mihomo_error = None;
+            }
+            Err(error) => self.mihomo_error = Some(format!("mihomo 设置未保存 · {error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn restore_mihomo_draft(&mut self, cx: &mut Context<Self>) {
+        let mihomo = self.launcher.read(cx).settings_snapshot().mihomo;
+        self.mihomo_auto_start = mihomo.auto_start;
+        self.mihomo_binary.update(cx, |input, cx| {
+            input.set_value(mihomo.binary_path.to_string_lossy().into_owned(), cx);
+        });
+        self.mihomo_config.update(cx, |input, cx| {
+            input.set_value(mihomo.config_path.to_string_lossy().into_owned(), cx);
+        });
+        self.mihomo_controller.update(cx, |input, cx| {
+            input.set_value(mihomo.controller, cx);
+        });
+        self.mihomo_secret.update(cx, |input, cx| {
+            input.set_value(mihomo.secret, cx);
+        });
+        self.mihomo_error = None;
+        cx.notify();
+    }
+
     fn plugins_page(&self, snapshot: Snapshot) -> Div {
         let directory = snapshot.data_dir.clone();
         column()
@@ -1593,6 +2036,44 @@ impl Settings {
     }
 }
 
+fn mihomo_status_label(state: &MihomoState) -> (String, u32) {
+    match &state.status {
+        MihomoStatus::Stopped => ("核心未运行".into(), MUTED),
+        MihomoStatus::Starting => ("正在启动 mihomo…".into(), MUTED),
+        MihomoStatus::Running { version, .. } => (
+            version.as_ref().map_or_else(
+                || "mihomo 运行中".into(),
+                |version| format!("mihomo {version} 运行中"),
+            ),
+            ACCENT,
+        ),
+        MihomoStatus::Stopping => ("正在停止 mihomo…".into(), MUTED),
+    }
+}
+
+fn mihomo_status_detail(snapshot: &Snapshot) -> String {
+    let controller = if snapshot.mihomo.controller.is_empty() {
+        "控制器未填写".to_owned()
+    } else {
+        snapshot.mihomo.controller.clone()
+    };
+    match &snapshot.mihomo_state.status {
+        MihomoStatus::Stopped => {
+            if snapshot.mihomo.configured() {
+                format!("控制器 {controller} · 等待启动")
+            } else {
+                "先选择 mihomo 可执行文件和配置文件，再启动核心。".into()
+            }
+        }
+        MihomoStatus::Starting => format!("控制器 {controller} · 正在等待核心就绪"),
+        MihomoStatus::Running { pid, .. } => match pid {
+            Some(pid) => format!("控制器 {controller} · PID {pid}"),
+            None => format!("控制器 {controller} · 进程已运行"),
+        },
+        MihomoStatus::Stopping => format!("控制器 {controller} · 正在停止进程"),
+    }
+}
+
 fn everything_status_label(enabled: bool, status: &everything::Status) -> (String, u32) {
     if !enabled {
         return ("已停用 · 使用 Moin 本地索引".into(), MUTED);
@@ -1746,6 +2227,7 @@ fn kit_icon_name(glyph: &str) -> IconName {
         "\u{e8d2}" => IconName::ALargeSmall,
         "\u{e765}" => IconName::SquareTerminal,
         "\u{e722}" => IconName::Frame,
+        "\u{e774}" => IconName::Network,
         "\u{ea86}" => IconName::LayoutDashboard,
         _ => IconName::Settings,
     }

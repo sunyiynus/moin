@@ -22,7 +22,10 @@ gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, fe
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 lancedb = { version = "=0.23.1", default-features = false }
+lurker-core-contract = "=0.68.7"
+lurker-core-ports = "=0.68.7"
 meval = "0.2"
+mihomo-driver = { version = "0.68.7", default-features = false, features = ["http", "process"] }
 plist = "1"
 rig = { package = "rig-core", version = "=0.46.0", default-features = false, features = ["reqwest", "rustls"] }
 rig-agent = { version = "=0.46.0", default-features = false }
