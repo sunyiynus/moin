@@ -1,5 +1,6 @@
 //! Screen selection, annotation, pinned images and recording controls.
 //! Every window owns its own GPUI state; capture work and GIF encoding run off the UI thread.
+mod recording_outline;
 use super::{
     Moin, appearance, launcher_window,
     ui::{self, UiWindow},
@@ -11,6 +12,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
 };
 use moin::{capture as backend, config::CaptureConfig};
+use recording_outline::RecordingOutline;
 use std::{
     cell::{Cell, RefCell},
     path::PathBuf,
@@ -48,7 +50,7 @@ fn stop_recording(cx: &mut App) -> bool {
                 if view.result.is_some() {
                     return false;
                 }
-                view.stop.store(true, Ordering::Release);
+                view.request_stop();
                 if view.countdown > 0 {
                     window.remove_window();
                 } else {
@@ -569,7 +571,8 @@ impl Render for Selection {
                 canvas(
                     move |bounds, _, _| bounds,
                     move |bounds, _, window, _| {
-                        let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+                        let _ =
+                            window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
                         if let Some(area) = selected {
                             let origin = bounds.origin;
                             let outer = bounds.size;
@@ -987,6 +990,7 @@ struct Recorder {
     finishing: bool,
     result: Option<Result<PathBuf, String>>,
     focus: FocusHandle,
+    outline: Option<RecordingOutline>,
     _lease: Option<Arc<Lease>>,
     _task: Option<Task<()>>,
 }
@@ -1015,6 +1019,20 @@ impl Recorder {
         let display_id = display_index
             .and_then(|index| displays.get(index))
             .map(|display| display.id());
+        let screen = display_index
+            .and_then(|index| screens.get(index))
+            .copied()
+            .context("显示器布局已改变，请重新选择录制区域")?;
+        #[cfg(windows)]
+        let thickness = display_index
+            .and_then(|index| displays.get(index))
+            .map(|display| {
+                (3. * screen.width as f32 / f32::from(display.bounds().size.width)).round() as u32
+            })
+            .unwrap_or(3);
+        #[cfg(not(windows))]
+        let thickness = 3;
+        let outline = RecordingOutline::open(region, screen, thickness)?;
         let handle = cx.open_window(
             WindowOptions {
                 titlebar: None,
@@ -1055,6 +1073,7 @@ impl Recorder {
                         finishing: false,
                         result: None,
                         focus,
+                        outline: Some(outline),
                         _lease: Some(lease),
                         _task: None,
                     };
@@ -1068,6 +1087,11 @@ impl Recorder {
             recorder: Some(UiWindow::from_handle(handle)),
         });
         Ok(())
+    }
+
+    fn request_stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.outline.take();
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -1085,6 +1109,9 @@ impl Recorder {
             for remaining in (1..=3).rev() {
                 let _ = view.update(cx, |view, cx| {
                     view.countdown = remaining;
+                    if let Some(outline) = &view.outline {
+                        outline.raise();
+                    }
                     cx.notify();
                 });
                 executor.timer(Duration::from_secs(1)).await;
@@ -1127,17 +1154,36 @@ impl Recorder {
                         let _ = view.update(cx, |view, cx| {
                             view.recording = false;
                             view.finishing = false;
+                            view.outline.take();
                             view._lease.take();
                             view.result = Some(result.map_err(|e: anyhow::Error| format!("{e:#}")));
                             cx.notify();
                         });
                         return;
                     }
-                    Err(async_channel::TryRecvError::Closed) => return,
+                    Err(async_channel::TryRecvError::Closed) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.recording = false;
+                            view.finishing = false;
+                            view.outline.take();
+                            view._lease.take();
+                            view.result = Some(Err("录制任务已中断".into()));
+                            cx.notify();
+                        });
+                        return;
+                    }
                     Err(async_channel::TryRecvError::Empty) => {}
                 }
                 executor.timer(Duration::from_millis(150)).await;
-                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                if view
+                    .update(cx, |view, cx| {
+                        if let Some(outline) = &view.outline {
+                            outline.raise();
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     stop.store(true, Ordering::Release);
                     return;
                 }
@@ -1195,14 +1241,14 @@ impl Render for Recorder {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if view.countdown > 0 || view.result.is_some() {
-                        view.stop.store(true, Ordering::Release);
+                        view.request_stop();
                         if view.countdown > 0 {
                             let launcher = view.launcher;
                             cx.defer(move |cx| restore_launcher(launcher, None, cx));
                         }
                         window.remove_window();
                     } else {
-                        view.stop.store(true, Ordering::Release);
+                        view.request_stop();
                         view.finishing = true;
                         cx.notify();
                     }
@@ -1260,7 +1306,7 @@ impl Render for Recorder {
             .disabled(self.finishing)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|view, _, window, cx| {
-                view.stop.store(true, Ordering::Release);
+                view.request_stop();
                 if view.countdown > 0 || view.result.is_some() {
                     if view.countdown > 0 {
                         let launcher = view.launcher;

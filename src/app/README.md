@@ -5,7 +5,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | `mod.rs` | 主浮窗：`Moin` 视图、搜索框、结果列表、预览、操作菜单、底部状态栏、整体布局 |
-| `settings.rs` | 设置窗口：搜索、索引、AI、外观、插件、常规页面 |
+| `settings.rs` | 设置窗口：搜索、索引、AI、mihomo 代理、外观、插件、常规页面 |
 | `input.rs` | GPUI Kit `Input` / `Textarea` 状态适配：同步业务文本与功能入口按键 |
 | `ui.rs` | GPUI Kit 初始化、窗口主题作用域、独立 Kit Root 和业务窗口句柄 |
 | `appearance.rs` | 字体解析、rem 缩放、SVG 图标、资源加载 |
@@ -34,6 +34,7 @@
 | `src/ai/mod.rs` | Rig Agent 后端 |
 | `src/ai/commands.rs` | 本机命令执行 |
 | `src/plugins/` | 插件运行时 |
+| `src/mihomo.rs` | mihomo 核心进程监督与控制器状态 |
 | `src/config.rs` | 配置文件读写 |
 | `src/hotkey.rs` | 快捷键解析与注册 |
 | `src/lib.rs` | 后端库模块入口 |

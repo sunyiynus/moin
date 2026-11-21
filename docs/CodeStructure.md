@@ -38,6 +38,7 @@ src/
 │
 ├── config.rs               # 跨业务配置
 ├── hotkey.rs               # 跨业务快捷键
+├── mihomo.rs               # mihomo 核心进程监督与控制器
 ├── lib.rs                  # 后端库入口
 ├── main.rs                 # 桌面应用入口
 └── README.md               # 目录说明

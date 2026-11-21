@@ -34,6 +34,7 @@ src/
 ├── bin/moin-cli.rs      # CLI / MCP
 ├── config.rs            # 配置读写：settings.json
 ├── hotkey.rs            # 快捷键解析与注册（跨领域）
+├── mihomo.rs            # mihomo 核心启动、停止与控制器状态
 ├── lib.rs               # 后端库入口
 └── main.rs              # 桌面应用入口
 ```
@@ -44,4 +45,5 @@ src/
 - 新增 Agent 能力放到 `src/ai/`。
 - 新增界面放到 `src/app/`；AI 对话界面在 `src/app/chat/`。
 - 新增插件能力放到 `src/plugins/`。
+- mihomo 核心的进程监督与控制器调用放在 `src/mihomo.rs`。
 - `config.rs`、`hotkey.rs` 是被多个业务域共用的基础设施。

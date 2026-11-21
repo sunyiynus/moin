@@ -311,6 +311,9 @@ fn native_windows_capture_geometry_and_toolbars_stay_in_bounds() {
     let result = Rc::new(RefCell::new(None));
     let captured = result.clone();
     gpui_kit::platform::application()
+        // Cases close their fixtures between awaits; keep the test application
+        // alive until the suite explicitly quits instead of exiting after case 1.
+        .with_quit_mode(QuitMode::Explicit)
         .with_assets(appearance::Assets)
         .run(move |cx| {
             ui::init(cx);
