@@ -8,6 +8,7 @@ use moin::search::everything;
 pub(crate) mod appearance;
 mod capture;
 mod chat;
+mod docsets;
 #[cfg(windows)]
 pub(crate) mod icons;
 pub(crate) mod input;
@@ -16,7 +17,7 @@ pub(crate) mod platform;
 mod preview;
 pub(crate) mod settings;
 pub(crate) mod ui;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use gpui::{prelude::*, *};
 use gpui_kit::component::{
     IconName, Sizable,
@@ -66,6 +67,7 @@ fn host_os() -> OperatingSystem {
 #[derive(Clone)]
 enum Command {
     Scope(SearchMode),
+    Docsets,
     Ai,
     Plugin(String, String),
     Capture(capture::CaptureKind),
@@ -94,6 +96,7 @@ actions!(
         Apps,
         Files,
         Text,
+        Docs,
         OpenSettings,
         Preview,
         MoreActions,
@@ -119,6 +122,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-,", OpenSettings, Some("Moin")),
         KeyBinding::new("ctrl-p", Preview, Some("Moin")),
         KeyBinding::new("ctrl-5", Ai, Some("Moin")),
+        KeyBinding::new("ctrl-6", Docs, Some("Moin")),
         KeyBinding::new("ctrl-n", NewChat, Some("Moin")),
     ]);
     #[cfg(target_os = "macos")]
@@ -133,6 +137,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-,", OpenSettings, Some("Moin")),
         KeyBinding::new("cmd-p", Preview, Some("Moin")),
         KeyBinding::new("cmd-5", Ai, Some("Moin")),
+        KeyBinding::new("cmd-6", Docs, Some("Moin")),
         KeyBinding::new("cmd-n", NewChat, Some("Moin")),
     ]);
 }
@@ -148,6 +153,9 @@ pub struct Moin {
     ai: chat::AiChat,
     input: Entity<SearchInput>,
     mode: SearchMode,
+    docsets_active: bool,
+    docsets: moin::docsets::Manager,
+    docset_view: Entity<docsets::DocSearch>,
     plugin_scope: Option<String>,
     hits: Vec<Hit>,
     selected: usize,
@@ -188,6 +196,7 @@ pub struct Moin {
     launcher_active: bool,
     _activation: Subscription,
     _subscription: Subscription,
+    _docsets_subscription: Subscription,
 }
 
 impl Moin {
@@ -211,6 +220,7 @@ impl Moin {
         let commands = [SearchMode::Apps, SearchMode::Files, SearchMode::Text]
             .into_iter()
             .map(Command::Scope)
+            .chain(std::iter::once(Command::Docsets))
             .chain(std::iter::once(Command::Ai))
             .chain([
                 Command::Capture(capture::CaptureKind::Screenshot),
@@ -234,6 +244,10 @@ impl Moin {
             home.join("index.sqlite3"),
         );
         let mihomo = moin::mihomo::MihomoService::new(home.join("mihomo"));
+        let docsets = moin::docsets::Manager::new(&home);
+        let owner = cx.entity().downgrade();
+        let docset_view = cx.new(|cx| docsets::DocSearch::new(docsets.clone(), owner, cx));
+        let docsets_subscription = cx.observe(&docset_view, |_, _, cx| cx.notify());
         // A global popup must not linger over whatever the user switched to; the
         // query, mode and AI session stay alive so the next summon resumes them.
         let activation = cx.observe_window_activation(window, |view, window, _| {
@@ -250,6 +264,9 @@ impl Moin {
             ai,
             input,
             mode: SearchMode::All,
+            docsets_active: false,
+            docsets,
+            docset_view,
             plugin_scope: None,
             hits: Vec::new(),
             selected: 0,
@@ -290,6 +307,7 @@ impl Moin {
             launcher_active: window.is_window_active(),
             _activation: activation,
             _subscription: subscription,
+            _docsets_subscription: docsets_subscription,
         };
         this.update_index(false, cx);
         this.refresh_everything_status(cx);
@@ -313,12 +331,17 @@ impl Moin {
     }
 
     fn is_plugin_query(&self, cx: &App) -> bool {
-        self.mode == SearchMode::All
+        !self.docsets_active
+            && self.mode == SearchMode::All
             && (self.plugin_scope.is_some() || self.plugins.recognizes(&self.query(cx)))
     }
 
     fn input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai.active || self.input.read(cx).is_composing() {
+            return;
+        }
+        if self.docsets_active {
+            self.refresh(cx);
             return;
         }
         if self.mode == SearchMode::All && self.plugin_scope.is_none() {
@@ -339,6 +362,12 @@ impl Moin {
                     }
                     PaletteEntry::Ai => {
                         self.enter_ai(window, cx);
+                    }
+                    PaletteEntry::Docsets => {
+                        self.enter_docsets(window, cx);
+                        self.input
+                            .update(cx, |input, cx| input.set_value(query, cx));
+                        self.refresh(cx);
                     }
                     PaletteEntry::Capture(kind) => self.start_capture(kind, window, cx),
                     PaletteEntry::Settings => {
@@ -428,6 +457,12 @@ impl Moin {
         self.hits.clear();
         self.scroll.set_offset(point(px(0.), px(0.)));
         let query = self.query(cx);
+        if self.docsets_active {
+            self.docset_view
+                .update(cx, |view, cx| view.query(query, cx));
+            cx.notify();
+            return;
+        }
         if self.is_plugin_query(cx) || self.indexing && !self.db.exists() {
             cx.notify();
             return;
@@ -494,6 +529,9 @@ impl Moin {
 
     fn set_mode(&mut self, mode: SearchMode, window: &mut Window, cx: &mut Context<Self>) {
         self.ai.active = false;
+        self.docsets_active = false;
+        self.docset_view
+            .update(cx, |view, cx| view.activate(false, cx));
         let plugin_query =
             self.plugin_scope.take().is_some() || self.plugins.recognizes(&self.query(cx));
         self.mode = mode;
@@ -616,6 +654,23 @@ impl Moin {
             .err()
             .map(|error| format!("无法启动 mihomo 核心 · {error:#}"));
         cx.notify();
+    }
+
+    pub fn adopt_mihomo_profile(
+        &mut self,
+        config: MihomoConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let previous = self.config.clone();
+        self.save_mihomo_config(config.clone(), cx)?;
+        if let Err(error) = self.mihomo.adopt(config) {
+            let restored = previous.save(&self.home);
+            self.config = previous;
+            cx.notify();
+            restored.context("核心未接受配置，恢复已保存的设置失败")?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn stop_mihomo(&mut self, cx: &mut Context<Self>) {
@@ -888,6 +943,7 @@ impl Moin {
                 self.set_mode(mode, window, cx);
             }
             FeatureAction::Ai => self.enter_ai(window, cx),
+            FeatureAction::Docsets => self.enter_docsets(window, cx),
             FeatureAction::Screenshot => {
                 self.start_capture(capture::CaptureKind::Screenshot, window, cx);
                 return;
@@ -1003,7 +1059,8 @@ impl Moin {
     }
 
     fn showing_commands(&self, cx: &App) -> bool {
-        self.mode == SearchMode::All
+        !self.docsets_active
+            && self.mode == SearchMode::All
             && self.plugin_scope.is_none()
             && self.input.read(cx).value().trim().is_empty()
     }
@@ -1090,6 +1147,14 @@ impl Moin {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.docsets_active {
+            self.docset_view.update(cx, |view, cx| {
+                if view.select_number(offset, cx) && run {
+                    view.open_selected(window, cx);
+                }
+            });
+            return;
+        }
         let len = self.hits.len()
             + if self.showing_commands(cx) {
                 self.commands.len()
@@ -1116,7 +1181,7 @@ impl Moin {
         if self.ai.active || self.composing(cx) {
             return;
         }
-        if self.mode != SearchMode::All {
+        if self.docsets_active || self.mode != SearchMode::All {
             self.set_mode(SearchMode::All, window, cx);
         } else if self.plugin_scope.is_some() || self.plugins.recognizes(&self.query(cx)) {
             self.set_mode(SearchMode::All, window, cx);
@@ -1179,6 +1244,11 @@ impl Moin {
             cx.notify();
             return;
         }
+        if self.docsets_active && !self.composing(cx) {
+            self.docset_view
+                .update(cx, |view, cx| view.move_selection(delta, cx));
+            return;
+        }
         let home = self.showing_commands(cx);
         let len = self.hits.len() + if home { self.commands.len() } else { 0 };
         if len == 0 || self.composing(cx) {
@@ -1206,6 +1276,11 @@ impl Moin {
             return;
         }
         if self.plugin_busy || self.composing(cx) {
+            return;
+        }
+        if self.docsets_active {
+            self.docset_view
+                .update(cx, |view, cx| view.open_selected(window, cx));
             return;
         }
         let query = self.query(cx);
@@ -1264,6 +1339,10 @@ impl Moin {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
+        if self.docsets_active && !self.composing(cx) {
+            self.docset_view.update(cx, |view, cx| view.copy(cx));
+            return;
+        }
         if self.ai.active {
             self.copy_ai(cx);
             return;
@@ -1297,6 +1376,9 @@ impl Moin {
 
     fn tool(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.ai.active = false;
+        self.docsets_active = false;
+        self.docset_view
+            .update(cx, |view, cx| view.activate(false, cx));
         self.mode = SearchMode::All;
         self.plugin_scope = Some(command.to_owned());
         self.input.update(cx, |input, cx| {
@@ -1314,6 +1396,9 @@ impl Moin {
         cx: &mut Context<Self>,
     ) {
         self.ai.active = false;
+        self.docsets_active = false;
+        self.docset_view
+            .update(cx, |view, cx| view.activate(false, cx));
         self.actions_open = false;
         self.plugin_scope = None;
         self.mode = SearchMode::All;
@@ -1332,6 +1417,19 @@ impl Moin {
         self.set_mode(SearchMode::All, window, cx);
         self.input.update(cx, |input, cx| input.clear(cx));
         self.set_ai(true, window, cx);
+    }
+
+    fn enter_docsets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(SearchMode::All, window, cx);
+        self.docsets_active = true;
+        self.docset_view
+            .update(cx, |view, cx| view.activate(true, cx));
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder("搜索离线文档，例如 rust: Vec…", cx);
+            input.clear(cx);
+            input.focus(window, cx);
+        });
+        self.refresh(cx);
     }
 
     /// Hides the floating launcher as soon as another window takes focus.
@@ -1368,12 +1466,19 @@ impl Moin {
         if self.composing(cx) {
             return;
         }
+        if self.docsets_active && self.docset_view.update(cx, |view, cx| view.back(cx)) {
+            if !self.docset_view.read(cx).reading() {
+                self.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        }
         if self.preview_open {
             self.preview_open = false;
             cx.notify();
             return;
         }
-        if self.mode != SearchMode::All
+        if self.docsets_active
+            || self.mode != SearchMode::All
             || self.plugin_scope.is_some()
             || self.plugins.recognizes(&self.query(cx))
         {
@@ -1395,7 +1500,25 @@ impl Moin {
         cx: &App,
     ) -> Vec<(ResultAction, &'static str, &'static str, &'static str)> {
         let mut actions = Vec::new();
-        if self.is_plugin_query(cx) {
+        if self.docsets_active {
+            if self.docset_view.read(cx).reading() {
+                actions.push((
+                    ResultAction::Copy,
+                    "复制文档正文",
+                    "\u{e8c8}",
+                    "Ctrl+Shift+C",
+                ));
+            }
+            if self.docset_view.read(cx).has_selection() {
+                actions.push((ResultAction::Run, "打开离线文档", "\u{e8a7}", "Enter"));
+                actions.push((
+                    ResultAction::Copy,
+                    "复制本地文档链接",
+                    "\u{e8c8}",
+                    "Ctrl+Shift+C",
+                ));
+            }
+        } else if self.is_plugin_query(cx) {
             actions.push((ResultAction::Run, "运行命令", "\u{e768}", "Enter"));
             if self.result.is_some() {
                 actions.push((ResultAction::Copy, "复制结果", "\u{e8c8}", "Ctrl+Shift+C"));
@@ -1512,6 +1635,7 @@ impl Moin {
         match self.commands.get(index).cloned() {
             Some(Command::Scope(mode)) => self.set_mode(mode, window, cx),
             Some(Command::Ai) => self.enter_ai(window, cx),
+            Some(Command::Docsets) => self.enter_docsets(window, cx),
             Some(Command::Plugin(prefix, _)) => self.tool(&prefix, window, cx),
             Some(Command::Capture(kind)) => self.start_capture(kind, window, cx),
             Some(Command::Settings) => self.open_settings(window, cx),
@@ -1535,6 +1659,10 @@ impl Moin {
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.docsets_active {
+            self.open_docset_settings(window, cx);
+            return;
+        }
         self.actions_open = false;
         let Some(launcher) = UiWindow::from_window(window) else {
             return;
@@ -1563,12 +1691,48 @@ impl Moin {
         });
     }
 
+    fn open_docset_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.actions_open = false;
+        let Some(launcher) = UiWindow::from_window(window) else {
+            return;
+        };
+        let existing = self.settings_window;
+        cx.defer(move |cx| {
+            if let Some(handle) = existing
+                && handle
+                    .update(cx, |settings, window, cx| {
+                        settings.show_docsets(cx);
+                        window.activate_window();
+                    })
+                    .is_ok()
+            {
+                let _ = launcher.update(cx, |_, window, _| launcher_window::hide(window));
+                return;
+            }
+            let result = settings::open_docsets(launcher, cx);
+            let _ = launcher.update(cx, |view, window, cx| {
+                match result {
+                    Ok(handle) => {
+                        view.settings_window = Some(handle);
+                        launcher_window::hide(window);
+                    }
+                    Err(error) => view.error = Some(format!("无法打开文档集设置 · {error:#}")),
+                }
+                cx.notify();
+            });
+        });
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> Div {
         let has_query = !self.input.read(cx).value().is_empty();
-        let scope = self.plugin_scope.as_ref().map_or_else(
-            || (self.mode != SearchMode::All).then(|| mode_label(self.mode).to_owned()),
-            |prefix| Some(plugin_label(prefix).to_owned()),
-        );
+        let scope = if self.docsets_active {
+            Some("离线文档".to_owned())
+        } else {
+            self.plugin_scope.as_ref().map_or_else(
+                || (self.mode != SearchMode::All).then(|| mode_label(self.mode).to_owned()),
+                |prefix| Some(plugin_label(prefix).to_owned()),
+            )
+        };
         row()
             .h(rem(72.))
             .flex_shrink_0()
@@ -1620,6 +1784,7 @@ impl Moin {
             Command::Scope(SearchMode::Text) => FeatureAction::Text,
             Command::Scope(SearchMode::All) => FeatureAction::All,
             Command::Ai => FeatureAction::Ai,
+            Command::Docsets => FeatureAction::Docsets,
             Command::Capture(capture::CaptureKind::Screenshot) => FeatureAction::Screenshot,
             Command::Capture(capture::CaptureKind::Gif) => FeatureAction::GifRecording,
             Command::Settings => FeatureAction::Settings,
@@ -1737,6 +1902,13 @@ impl Moin {
                         "\u{e8f2}",
                         LIME,
                         Some("i"),
+                    ),
+                    Command::Docsets => (
+                        "搜索文档".into(),
+                        "Dash 离线 Docsets".into(),
+                        "\u{e82d}",
+                        0x9bd4ff,
+                        Some("h"),
                     ),
                     Command::Capture(capture::CaptureKind::Screenshot) => (
                         "截图".into(),
@@ -2108,7 +2280,11 @@ impl Moin {
     }
 
     fn footer(&self, plugin: bool, cx: &mut Context<Self>) -> Div {
-        let has_result = self.hits.get(self.selected).is_some();
+        let has_result = if self.docsets_active {
+            self.docset_view.read(cx).has_selection()
+        } else {
+            self.hits.get(self.selected).is_some()
+        };
         let can_open = has_result || self.showing_commands(cx) || plugin;
         let copy_output = plugin && self.result.is_some();
         let feedback = self
@@ -2117,7 +2293,9 @@ impl Moin {
             .or(self.notice.as_ref())
             .cloned()
             .unwrap_or_else(|| {
-                if self.mode != SearchMode::All || self.plugin_scope.is_some() {
+                if self.docsets_active {
+                    self.docset_view.read(cx).back_hint().into()
+                } else if self.mode != SearchMode::All || self.plugin_scope.is_some() {
                     "Esc 返回全局搜索".into()
                 } else if self.showing_commands(cx) {
                     "键入入口键进入功能".into()
@@ -2189,6 +2367,8 @@ impl Render for Moin {
         let plugin = self.is_plugin_query(cx);
         let body = if self.ai.active {
             self.ai.pane.clone().into_any_element()
+        } else if self.docsets_active {
+            self.docset_view.clone().into_any_element()
         } else if plugin {
             self.plugin_view(&query, cx).into_any_element()
         } else if self.preview_open && self.preview_key.is_some() {
@@ -2250,6 +2430,7 @@ impl Render for Moin {
                 .on_action(cx.listener(|view, _: &Text, window, cx| {
                     view.set_mode(SearchMode::Text, window, cx)
                 }))
+                .on_action(cx.listener(|view, _: &Docs, window, cx| view.enter_docsets(window, cx)))
                 .size_full()
                 .relative()
                 .rounded(px(8.))
@@ -2286,6 +2467,7 @@ fn row() -> Div {
 #[derive(Clone, Copy)]
 enum PaletteEntry {
     Scope(SearchMode),
+    Docsets,
     Ai,
     Plugin(&'static str),
     Capture(capture::CaptureKind),
@@ -2309,6 +2491,7 @@ fn parse_entry(value: &str) -> Option<(PaletteEntry, String)> {
         "a" => PaletteEntry::Scope(SearchMode::Apps),
         "f" => PaletteEntry::Scope(SearchMode::Files),
         "t" => PaletteEntry::Scope(SearchMode::Text),
+        "h" | "doc" | "docs" | "dash" | "文档" => PaletteEntry::Docsets,
         "i" | "ai" if arguments.is_empty() => PaletteEntry::Ai,
         "c" | "calc" => PaletteEntry::Plugin("="),
         "r" | "tr" | "翻译" => PaletteEntry::Plugin("翻译"),
@@ -2454,7 +2637,10 @@ fn collapse(text: &str) -> String {
 
 fn section_label(label: &'static str) -> Label {
     Label::new(label)
-        .id((ElementId::from("section-label"), SharedString::new_static(label)))
+        .id((
+            ElementId::from("section-label"),
+            SharedString::new_static(label),
+        ))
         .px(px(16.))
         .h(rem(28.))
         .flex()
@@ -2469,10 +2655,10 @@ fn kind_label(label: &'static str) -> Tag {
         .px_2()
         .text_size(rem(12.))
         .text_color(rgb(MUTED))
-        .child(
-            Label::new(label)
-                .id((ElementId::from("kind-label"), SharedString::new_static(label))),
-        )
+        .child(Label::new(label).id((
+            ElementId::from("kind-label"),
+            SharedString::new_static(label),
+        )))
 }
 
 fn entry(
@@ -2632,7 +2818,10 @@ pub fn listen_to_tray(
         while let Ok(event) = receiver.recv().await {
             let result = match event {
                 TrayEvent::Quit => {
-                    let _ = handle.update(cx, |view, _, _| view.shutdown_mihomo());
+                    let _ = handle.update(cx, |view, _, _| {
+                        view.docsets.cancel();
+                        view.shutdown_mihomo();
+                    });
                     let _ = cx.update(|app| app.quit());
                     return;
                 }
@@ -2691,7 +2880,10 @@ pub fn listen_to_tray(
                 break;
             }
         }
-        let _ = handle.update(cx, |view, _, _| view.shutdown_mihomo());
+        let _ = handle.update(cx, |view, _, _| {
+            view.docsets.cancel();
+            view.shutdown_mihomo();
+        });
         let _ = cx.update(|app| app.quit());
     })
     .detach();
@@ -2785,6 +2977,23 @@ mod palette_tests {
             Some((SearchMode::Text, "检索内容".into()))
         );
         assert_eq!(parse_scope("搜索 file 内容"), None);
+    }
+    #[::core::prelude::v1::test]
+    fn docsets_entry_preserves_queries_and_keeps_dictionary_key() {
+        for value in ["h", "docs rust: Vec", "dash python list", "文档 Rust"] {
+            assert!(matches!(
+                parse_entry(value),
+                Some((PaletteEntry::Docsets, _))
+            ));
+        }
+        let Some((PaletteEntry::Docsets, query)) = parse_entry("docs rust: Vec::new") else {
+            panic!("docs entry missing");
+        };
+        assert_eq!(query, "rust: Vec::new");
+        assert!(matches!(
+            parse_entry("d hello"),
+            Some((PaletteEntry::Plugin("词典"), _))
+        ));
     }
     #[::core::prelude::v1::test]
     fn shifted_number_row_keys_still_select_the_corresponding_result() {

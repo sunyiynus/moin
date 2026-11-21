@@ -31,6 +31,7 @@ pub enum FeatureAction {
     Apps,
     Files,
     Text,
+    Docsets,
     Ai,
     Calculator,
     Translation,
@@ -42,11 +43,12 @@ pub enum FeatureAction {
 }
 
 impl FeatureAction {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::All,
         Self::Apps,
         Self::Files,
         Self::Text,
+        Self::Docsets,
         Self::Ai,
         Self::Calculator,
         Self::Translation,
@@ -63,6 +65,7 @@ impl FeatureAction {
             Self::Apps => "搜索应用",
             Self::Files => "搜索文件",
             Self::Text => "搜索正文",
+            Self::Docsets => "离线文档搜索",
             Self::Ai => "AI 对话",
             Self::Calculator => "计算器",
             Self::Translation => "翻译",
@@ -80,6 +83,7 @@ impl FeatureAction {
             Self::Apps => "唤起浮窗并直接搜索已安装的应用。",
             Self::Files => "唤起浮窗并直接搜索文件或文件夹。",
             Self::Text => "唤起浮窗并直接搜索已索引的正文。",
+            Self::Docsets => "唤起浮窗并直接搜索已安装的 Dash 文档集。",
             Self::Ai => "唤起浮窗并进入 AI 对话。",
             Self::Calculator => "唤起浮窗并输入计算表达式。",
             Self::Translation => "唤起浮窗并输入要翻译的内容。",

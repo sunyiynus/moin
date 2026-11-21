@@ -15,12 +15,15 @@ async-compression = { version = "=0.4.19", default-features = false }
 directories = "6"
 extism = { version = "=1.41.0", default-features = false }
 futures = "0.3"
+flate2 = "1"
 gif = { version = "=0.13.3", features = ["raii_no_panic"] }
 # GPUI Kit pins its GPUI core to the gpui-pre 0.3.12 snapshot and re-exports it.
 # Alias the same package as `gpui` so the existing `use gpui::...` paths stay compatible.
 gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, features = ["windows-manifest"] }
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 lancedb = { version = "=0.23.1", default-features = false }
 lurker-core-contract = "=0.68.7"
 lurker-core-ports = "=0.68.7"
@@ -29,12 +32,18 @@ mihomo-driver = { version = "0.68.7", default-features = false, features = ["htt
 plist = "1"
 rig = { package = "rig-core", version = "=0.46.0", default-features = false, features = ["reqwest", "rustls"] }
 rig-agent = { version = "=0.46.0", default-features = false }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+quick-xml = "0.42"
+percent-encoding = "2"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
 unicode-segmentation = "1.12"
-ureq = { version = "2.12", default-features = false, features = ["json"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 url = "2"
 walkdir = "2"
 

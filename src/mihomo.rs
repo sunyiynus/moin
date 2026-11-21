@@ -5,15 +5,13 @@
 //! 重新加载并持续汇报状态的后台服务。
 
 use crate::config::MihomoConfig;
+pub mod management;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use lurker_core_contract::core_process::CoreProcessStartContext;
 use lurker_core_contract::lifecycle::CoreLifecycle;
 use lurker_core_ports::core_process::{CoreProcess, CoreReadiness};
-use mihomo_driver::{
-    api::client::MihomoClient,
-    driver::{ControllerReadiness, ProcessCoreController},
-};
+use mihomo_driver::driver::{ControllerReadiness, ProcessCoreController};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -64,6 +62,7 @@ pub struct MihomoState {
 
 enum Command {
     Start(MihomoConfig),
+    Adopt(MihomoConfig),
     Stop,
     Reload,
     Refresh,
@@ -132,6 +131,11 @@ impl MihomoService {
 
     pub fn stop(&self) -> Result<()> {
         self.send(Command::Stop)
+    }
+
+    /// Record a configuration already loaded successfully through the controller.
+    pub fn adopt(&self, config: MihomoConfig) -> Result<()> {
+        self.send(Command::Adopt(config))
     }
 
     pub fn reload(&self) -> Result<()> {
@@ -218,6 +222,11 @@ fn run_worker(
                     .await;
                 }
                 Command::Stop => stop_core(&mut controller, &mut running, &state).await,
+                Command::Adopt(config) => {
+                    if running.is_some() {
+                        running = Some(config);
+                    }
+                }
                 Command::Reload => reload_core(running.as_ref(), &state).await,
                 Command::Refresh => {
                     refresh_core(&mut controller, &mut running, &state).await;
@@ -407,8 +416,13 @@ async fn reload_core(running: Option<&MihomoConfig>, state: &watch::Sender<Mihom
         report_error(state, None, "mihomo 核心未运行，无法重新加载配置");
         return;
     };
-    match MihomoClient::new(&config.controller, config.secret()) {
-        Ok(client) => match client.reload_config(None).await {
+    let config = config.clone();
+    match tokio::task::spawn_blocking(move || {
+        management::Controller::new(&config)?.reload(&config.config_path)
+    })
+    .await
+    {
+        Ok(result) => match result {
             Ok(()) => {
                 let mut next = state.borrow().clone();
                 next.error = None;
@@ -417,7 +431,7 @@ async fn reload_core(running: Option<&MihomoConfig>, state: &watch::Sender<Mihom
             }
             Err(error) => report_error(state, None, format!("mihomo 配置重新加载失败 · {error}")),
         },
-        Err(error) => report_error(state, None, format!("mihomo 控制器不可用 · {error}")),
+        Err(error) => report_error(state, None, format!("mihomo 控制器任务失败 · {error}")),
     }
 }
 

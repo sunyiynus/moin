@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+mod docsets;
+mod mihomo_panel;
 
 use super::ui::UiWindow;
 use gpui::{prelude::*, *};
@@ -98,6 +100,7 @@ pub struct Snapshot {
 enum Page {
     Search,
     Index,
+    Docsets,
     Plugins,
     Ai,
     Appearance,
@@ -105,6 +108,12 @@ enum Page {
     Shortcuts,
     Capture,
     Mihomo,
+    MihomoOverview,
+    MihomoProfiles,
+    MihomoProxies,
+    MihomoConnections,
+    MihomoRules,
+    MihomoLogs,
 }
 
 impl Page {
@@ -112,13 +121,20 @@ impl Page {
         match self {
             Self::Search => "搜索",
             Self::Index => "索引",
+            Self::Docsets => "离线文档 · Docsets",
             Self::Plugins => "扩展插件",
             Self::Ai => "AI 助手",
             Self::Appearance => "外观",
             Self::App => "常规",
             Self::Shortcuts => "快捷键",
             Self::Capture => "截图与录制",
-            Self::Mihomo => "mihomo 代理",
+            Self::Mihomo => "内核设置",
+            Self::MihomoOverview => "概览",
+            Self::MihomoProfiles => "订阅配置",
+            Self::MihomoProxies => "代理与策略组",
+            Self::MihomoConnections => "活动连接",
+            Self::MihomoRules => "路由规则",
+            Self::MihomoLogs => "核心日志",
         }
     }
 
@@ -132,6 +148,7 @@ impl Page {
                 }
             }
             Self::Index => "选择需要建立正文索引的目录。",
+            Self::Docsets => "从 Dash 官方源下载文档集，在浮窗中离线查询开发文档。",
             Self::Plugins => "查看可用命令，安装和管理本地扩展。",
             Self::Ai => "配置浮窗对话使用的模型，以及本地文档检索。",
             Self::Appearance => "分别调整 AI 对话与其余界面的字体和字号。",
@@ -139,6 +156,12 @@ impl Page {
             Self::Shortcuts => "为各功能分配全局快捷键，直接唤起浮窗并进入对应功能。",
             Self::Capture => "框选屏幕截图、贴图，或将选定区域录制为 GIF 动图。",
             Self::Mihomo => "启动本机 mihomo (Clash.Meta) 核心，并读取控制器运行状态。",
+            Self::MihomoOverview => "查看流量、核心状态，调整代理模式与网络设置。",
+            Self::MihomoProfiles => "添加订阅链接或本地配置，更新并切换当前使用的配置。",
+            Self::MihomoProxies => "选择策略组和节点，测试连接延迟。",
+            Self::MihomoConnections => "查看连接流量、匹配规则与代理链，断开指定连接。",
+            Self::MihomoRules => "按核心顺序查看和搜索当前生效的路由规则。",
+            Self::MihomoLogs => "查看托管核心输出的最新日志。",
         }
     }
 
@@ -146,6 +169,7 @@ impl Page {
         match self {
             Self::Search => "\u{e721}",
             Self::Index => "\u{e8a5}",
+            Self::Docsets => "\u{e82d}",
             Self::Plugins => "\u{ea86}",
             Self::Ai => "\u{e8f2}",
             Self::Appearance => "\u{e8d2}",
@@ -153,7 +177,25 @@ impl Page {
             Self::Shortcuts => "\u{e765}",
             Self::Capture => "\u{e722}",
             Self::Mihomo => "\u{e774}",
+            Self::MihomoOverview
+            | Self::MihomoProfiles
+            | Self::MihomoProxies
+            | Self::MihomoConnections
+            | Self::MihomoRules
+            | Self::MihomoLogs => "\u{e774}",
         }
+    }
+
+    fn manager_page(self) -> Option<mihomo_panel::Page> {
+        Some(match self {
+            Self::MihomoOverview => mihomo_panel::Page::Overview,
+            Self::MihomoProfiles => mihomo_panel::Page::Profiles,
+            Self::MihomoProxies => mihomo_panel::Page::Proxies,
+            Self::MihomoConnections => mihomo_panel::Page::Connections,
+            Self::MihomoRules => mihomo_panel::Page::Rules,
+            Self::MihomoLogs => mihomo_panel::Page::Logs,
+            _ => return None,
+        })
     }
 }
 
@@ -206,6 +248,8 @@ pub struct Settings {
     mihomo_auto_start: bool,
     mihomo_picker: Option<MihomoTarget>,
     mihomo_error: Option<String>,
+    mihomo_panel: Entity<mihomo_panel::MihomoPanel>,
+    docsets_panel: Entity<docsets::DocsetsPanel>,
     _field_subscriptions: Vec<Subscription>,
     _subscription: Subscription,
 }
@@ -216,6 +260,10 @@ pub fn open(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<S
 
 pub fn open_ai(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
     open_page(launcher, Page::Ai, cx)
+}
+
+pub fn open_docsets(launcher: UiWindow<Moin>, cx: &mut App) -> anyhow::Result<UiWindow<Settings>> {
+    open_page(launcher, Page::Docsets, cx)
 }
 
 fn open_page(
@@ -378,6 +426,14 @@ fn open_page(
                     mihomo_auto_start: mihomo.auto_start,
                     mihomo_picker: None,
                     mihomo_error: None,
+                    mihomo_panel: {
+                        let owner = cx.entity().downgrade();
+                        cx.new(|cx| mihomo_panel::MihomoPanel::new(launcher.clone(), owner, cx))
+                    },
+                    docsets_panel: {
+                        let manager = launcher.read(cx).docsets.clone();
+                        cx.new(|cx| docsets::DocsetsPanel::new(manager, cx))
+                    },
                     _field_subscriptions: subscriptions,
                     _subscription: cx.observe(&launcher, |_, _, cx| cx.notify()),
                     launcher,
@@ -398,6 +454,7 @@ impl Render for Settings {
         let content = match self.page {
             Page::Search => self.search_page(snapshot, cx),
             Page::Index => self.index_page(snapshot, cx),
+            Page::Docsets => div().child(self.docsets_panel.clone()),
             Page::Plugins => self.plugins_page(snapshot),
             Page::Ai => self.ai_page(snapshot, cx),
             Page::Appearance => self.appearance_page(snapshot, cx),
@@ -405,6 +462,12 @@ impl Render for Settings {
             Page::Shortcuts => self.shortcuts_page(snapshot, cx),
             Page::Capture => self.capture_page(snapshot, cx),
             Page::Mihomo => self.mihomo_page(snapshot, cx),
+            Page::MihomoOverview
+            | Page::MihomoProfiles
+            | Page::MihomoProxies
+            | Page::MihomoConnections
+            | Page::MihomoRules
+            | Page::MihomoLogs => div().child(self.mihomo_panel.clone()),
         };
         let tree = div()
             .size_full()
@@ -462,9 +525,11 @@ impl Render for Settings {
 }
 
 impl Settings {
+    pub fn show_docsets(&mut self, cx: &mut Context<Self>) {
+        self.navigate(Page::Docsets, cx);
+    }
     pub fn show_ai(&mut self, cx: &mut Context<Self>) {
-        self.page = Page::Ai;
-        self.hotkey_recording = false;
+        self.navigate(Page::Ai, cx);
         self.hotkey_capture_error = None;
         cx.notify();
     }
@@ -489,6 +554,66 @@ impl Settings {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> Sidebar<SidebarMenu> {
+        let loaded = !self
+            .launcher
+            .read(cx)
+            .settings_snapshot()
+            .mihomo
+            .config_path
+            .as_os_str()
+            .is_empty();
+        let mut menu = SidebarMenu::new();
+        for page in [
+            Page::App,
+            Page::Shortcuts,
+            Page::Appearance,
+            Page::Search,
+            Page::Index,
+            Page::Docsets,
+            Page::Ai,
+            Page::Mihomo,
+            Page::Capture,
+            Page::Plugins,
+        ] {
+            let item = if page == Page::Mihomo {
+                let item = SidebarMenuItem::new("Mihomo")
+                    .icon(kit_icon_name(page.icon()))
+                    .active(self.page == Page::Mihomo || self.page.manager_page().is_some())
+                    .default_open(true)
+                    .click_to_open(true)
+                    .on_click(
+                        cx.listener(|view, _, _, cx| view.navigate(Page::MihomoProfiles, cx)),
+                    );
+                if loaded {
+                    item.children(
+                        [
+                            Page::MihomoOverview,
+                            Page::MihomoProfiles,
+                            Page::MihomoProxies,
+                            Page::MihomoConnections,
+                            Page::MihomoRules,
+                            Page::MihomoLogs,
+                            Page::Mihomo,
+                        ]
+                        .map(|child| {
+                            SidebarMenuItem::new(child.label())
+                                .active(self.page == child)
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| view.navigate(child, cx)),
+                                )
+                        }),
+                    )
+                } else {
+                    item
+                }
+            } else {
+                SidebarMenuItem::new(page.label())
+                    .icon(kit_icon_name(page.icon()))
+                    .active(self.page == page)
+                    .on_click(cx.listener(move |view, _, _, cx| view.navigate(page, cx)))
+            };
+            menu = menu.child(item);
+        }
         Sidebar::new("settings-sidebar")
             .collapsible(false)
             .w(px(224.))
@@ -503,32 +628,21 @@ impl Settings {
                     .child(title("Moin", 17.))
                     .child(description("设置")),
             )
-            .child(
-                SidebarMenu::new().children(
-                    [
-                        Page::App,
-                        Page::Shortcuts,
-                        Page::Appearance,
-                        Page::Search,
-                        Page::Index,
-                        Page::Ai,
-                        Page::Mihomo,
-                        Page::Capture,
-                        Page::Plugins,
-                    ]
-                    .map(|page| {
-                        SidebarMenuItem::new(page.label())
-                            .icon(kit_icon_name(page.icon()))
-                            .active(self.page == page)
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.page = page;
-                                view.hotkey_recording = false;
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
+            .child(menu)
             .footer(description(format!("Moin {}", env!("CARGO_PKG_VERSION"))))
+    }
+
+    fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
+        self.hotkey_recording = false;
+        self.mihomo_panel.update(cx, |panel, cx| {
+            if let Some(page) = page.manager_page() {
+                panel.set_page(page, cx);
+            } else {
+                panel.hide();
+            }
+        });
+        cx.notify();
     }
 
     fn search_page(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> Div {
@@ -2129,7 +2243,8 @@ fn card() -> Div {
 }
 
 #[track_caller]
-fn section(label: &'static str) -> GroupBox {
+fn section(label: impl Into<SharedString>) -> GroupBox {
+    let label = label.into();
     GroupBox::new()
         .id(SharedString::from(format!("settings-section-{label}")))
         .title(title(label, 14.))
@@ -2243,7 +2358,9 @@ fn input_field(
                 .cursor(CursorStyle::IBeam)
                 .hover(|style| style.bg(rgb(0xfafafa)))
                 .focus(|style| style.border_color(rgb(ACCENT)))
-                .on_click(move |_, window, cx| target.update(cx, |input, cx| input.focus(window, cx)))
+                .on_click(move |_, window, cx| {
+                    target.update(cx, |input, cx| input.focus(window, cx))
+                })
                 .child(input.clone()),
         )
 }
